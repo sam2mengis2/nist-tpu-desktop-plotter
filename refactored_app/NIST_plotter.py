@@ -315,6 +315,76 @@ class NIST_DATA_ANALYZER(NIST_Interface):
         plt.show()
 
     def get_std_contour(self, face_no, flat_tap_coords, pressure_series):
-        return False
+            # 1. Calculate the standard deviation (std) across each column channel
+            std_cp_series = pressure_series.std(axis=0)
+
+            pressure_df = std_cp_series.reset_index()
+            pressure_df.columns = ['Tap no.', 'std_cp']
+            
+            all_stds = pressure_df['std_cp'].values
+            num_taps = len(flat_tap_coords)
+            matched_stds = all_stds[:num_taps]
+
+            # 2. Safely copy the coordinates and paste the std values into it
+            # Making a copy prevents overwriting the columns used by your mean plots
+            coords_copy = flat_tap_coords.copy()
+            coords_copy['std_cp'] = matched_stds        
+            
+            face_dfs = {}
+
+            # 3. Find all the unique face numbers in your dataset
+            unique_faces = coords_copy[1].dropna().unique()
+
+            # 4. Loop through and slice the master table
+            for face_num in unique_faces:
+                face_data = coords_copy[coords_copy[1] == face_num].copy()
+                face_dfs[face_num] = face_data
+
+            face_df = face_dfs[face_no]
+
+            # Create a temporary DataFrame to safely drop duplicate spatial locations
+            clean_df = face_df.drop_duplicates(subset=[2, 3])
+            x = clean_df[2].values
+            y = clean_df[3].values
+            z = clean_df['std_cp'].values
+
+            # 5. Define the grid resolution
+            grid_x, grid_y = np.meshgrid(
+                np.linspace(x.min(), x.max(), 100),
+                np.linspace(y.min(), y.max(), 100)
+            )
+
+            # 6. Interpolate the std_cp values onto the grid
+            grid_z = griddata((x, y), z, (grid_x, grid_y), method='cubic')
+
+            # 7. Generate the contour plot
+            plt.figure(figsize=(8, 6))
+            
+            # Using YlOrRd since standard deviations are always positive numbers
+            contour = plt.contourf(grid_x, grid_y, grid_z, levels=20, cmap='YlOrRd')
+            
+            # Add the formatted colorbar scale
+            import matplotlib.ticker as ticker
+            cbar = plt.colorbar(contour, label="Std Dev $C_p$")
+            cbar.ax.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.1f'))
+
+            # Overlay the tap locations to verify grid coverage
+            plt.scatter(x, y, c='black', s=15, marker='x', label='Taps')
+
+            plt.title(f"Face {int(face_no)} Standard Deviation Pressure Distribution", fontweight='bold')
+            plt.xlabel("X")
+            plt.ylabel("Y")
+            plt.legend()
+
+            # Grab your current minimums and maximums
+            current_x_min, current_x_max = plt.xlim()
+            current_y_min, current_y_max = plt.ylim()
+
+            # Keeps your identical 2.5 unit layout zoom-out buffer shift
+            buffer = 2.5 
+            plt.xlim(current_x_min - buffer, current_x_max + buffer)
+            plt.ylim(current_y_min - buffer, current_y_max + buffer)
+            
+            plt.show()
 
  

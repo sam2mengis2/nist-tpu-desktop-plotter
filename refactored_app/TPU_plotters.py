@@ -1,3 +1,4 @@
+from interface import TPU_Interface
 import pandas as pd
 import io
 from scipy.interpolate import griddata
@@ -7,13 +8,18 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from pyhdf.SD import SD, SDC
 from scipy.io import loadmat
 from mpl_toolkits.mplot3d import Axes3D
-from pyhdf.SD import SD, SDC
+import matplotlib
+matplotlib.use('QtAgg')  # Forces Matplotlib to safely integrate with your PyQt6 window loop
 import matplotlib.pyplot as plt
 from itertools import islice
-from interface import TPU_Interface
+import matplotlib.ticker as ticker
 
 
-class TPU_High_Rise_Analyzer(TPU_Interface):
+
+
+
+
+class TPU_HIGH_RISE_ANALYZER(TPU_Interface):
     def __init__(self, mat_path):
         self.mat_path = mat_path
         self.data = loadmat(mat_path)
@@ -31,155 +37,23 @@ class TPU_High_Rise_Analyzer(TPU_Interface):
             loc_df['Y'] = loc_df['Y'] / 1000.0
         return loc_df
     
+
     def get_timeseries_df(self):
         pressure_df = pd.DataFrame(self.data['Wind_pressure_coefficients'])
         return pressure_df
     
     def get_channel_plot(self, loc_df, pressure_df):
-        plt.figure(figsize=(12, 6))
+        x = loc_df['X']
+        y = loc_df['Y']
 
-        # 2. MATCH SIZES: Cap the location coordinates to the exact number of active channels
-        total_active_channels = pressure_df.shape[1] # Number of columns in pressure matrix (200)
-        active_loc_df = loc_df.head(total_active_channels).copy()
 
-        # 3. Double-check column mapping if things look upside down:
-        # If X and Y are swapped in the source matrix, flip them here:
-        # x_coords = active_loc_df['Y'] 
-        # y_coords = active_loc_df['X']
-        x_coords = active_loc_df['X']
-        y_coords = active_loc_df['Y']
-
-        # Plot the active taps as blue crosses
-        plt.scatter(x_coords, y_coords, marker='+', color='blue', s=100, linewidth=1)
-
-        # 4. Iterate ONLY through the active capped dataframe
-        for index, row in active_loc_df.iterrows():
-            point_num = int(row['Point_No'])
-            x_val = row['X']
-            y_val = row['Y']
-            
-            # Offset the text slightly down and to the right so it doesn't overlap
-            plt.text(x_val + 0.002, y_val - 0.002, str(point_num), 
-                     color='black', fontsize=9, ha='left', va='top')
-
-        # Add the vertical dashed lines separating sections
-
-        # 1. Sort the taps horizontally from left to right
-        sorted_loc = active_loc_df.sort_values(by='X')
-
-        # 2. Track where the Face Number changes from one row to the next
-        face_changes = sorted_loc['Face_No'].ne(sorted_loc['Face_No'].shift())
-        
-        # 3. Extract the exact X-coordinates where those shifts happen
-        # We skip the very first point (index 0) because that's just the outer left wall
-        boundary_xs = sorted_loc[face_changes]['X'].values[1:]
-
-        # 4. Draw the dashed boundary lines exactly at the structural seam transitions
-        for v_line in boundary_xs:
-
-            snapped_line = round(v_line, 1)
-            plt.axvline(x=snapped_line, color='blue', linestyle='--', alpha=0.5)
-
-        # Lock the axes limits perfectly to the original geometry bounds
-        x_min, x_max = x_coords.min(), x_coords.max()
-        y_min, y_max = y_coords.min(), y_coords.max()
-        
-        x_buffer = (x_max - x_min) * 0.1 if x_max != x_min else 0.05
-        y_buffer = (y_max - y_min) * 0.1 if y_max != y_min else 0.05
-
-        plt.xlim(max(0, x_min - x_buffer), x_max + x_buffer)
-        plt.ylim(max(0, y_min - y_buffer), y_max + y_buffer)
+        plt.scatter(loc_df['X'], loc_df['Y'], marker='+', color='blue', s=50, linewidth=1)
 
         plt.title("Channels position", fontweight='bold', fontsize=12)
         plt.xlabel("Horizontal Direction /m", fontsize=11)
         plt.ylabel("Vertical Direction /m", fontsize=11)
 
-        plt.tight_layout()
-        plt.show()
-
-    def mean_cp_contour(self, pressure_df, loc_df, face_no):
-        # 1. Calculate the mean pressure coefficient (Cp) for every single channel
-        mean_cp_series = pressure_df.mean(axis=0)
-        mean_cp_df = mean_cp_series.reset_index()
-        mean_cp_df.columns = ['Tap no.', 'mean_cp']
-
-        all_means = mean_cp_df['mean_cp'].values
-        num_taps = len(loc_df)
-        matched_means = all_means[:num_taps]
-
-        # Paste the calculated means directly into a copy of the coordinate DataFrame
-        working_loc_df = loc_df.copy()
-        working_loc_df['mean_cp'] = matched_means
-
-        # =====================================================================
-        # OPTION B INTEGRATION: DROP SPATIAL DUPLICATES TO PREVENT QHULL ERRORS
-        # =====================================================================
-        clean_df = working_loc_df.drop_duplicates(subset=['X', 'Y'])
-
-        x = clean_df['X'].values
-        y = clean_df['Y'].values
-        z = clean_df['mean_cp'].values
-
-        # =====================================================================
-        # DYNAMIC GRID GENERATION (Scales automatically to any dataset size)
-        # =====================================================================
-        x_min, x_max = x.min(), x.max()
-        y_min, y_max = y.min(), y.max()
-
-        # Create a dense grid mesh based on the absolute dimensions of the active data
-        grid_x, grid_y = np.meshgrid(
-            np.linspace(x_min, x_max, 200),
-            np.linspace(y_min, y_max, 100)
-        )
-
-        # Interpolate the scattered pressure points onto the dense coordinate grid mesh
-        grid_z = griddata((x, y), z, (grid_x, grid_y), method='cubic')
-
-        # =====================================================================
-        # PLOTTING AND VISUALIZATION
-        # =====================================================================
-        plt.figure(figsize=(12, 6))
-
-        # Plot the smooth color contour bands (RdBu_r = Classic Aerodynamic Red/Blue map)
-        contour = plt.contourf(grid_x, grid_y, grid_z, levels=20, cmap='RdBu_r', alpha=0.85)
-
-        # Add the colorbar legend to the right side
-        cbar = plt.colorbar(contour)
-        cbar.set_label('Mean Pressure Coefficient ($C_p$)', fontsize=11)
-
-        # Overlay the original tap locations as black crosses for visibility contrast
-        plt.scatter(x, y, marker='+', color='black', s=60, linewidth=1)
-
-        # Overlay the tap text labels
-        for index, row in clean_df.iterrows():
-            # Dynamic label offsets based on graph size metrics
-            x_offset = (x_max - x_min) * 0.005
-            y_offset = (y_max - y_min) * 0.015
-            
-            plt.text(row['X'] + x_offset, row['Y'] - y_offset, str(int(row['Point_No'])), 
-                        color='black', fontsize=8, ha='left', va='top')
-
-        # Dynamic Face Boundaries: Detect transitions and round to nearest decimal place
-        sorted_loc = clean_df.sort_values(by='X')
-        face_changes = sorted_loc['Face_No'].ne(sorted_loc['Face_No'].shift())
-        boundary_xs = sorted_loc[face_changes]['X'].values[1:]
-
-        for v_line in boundary_xs:
-            snapped_line = round(v_line, 1)
-            plt.axvline(x=snapped_line, color='black', linestyle='--', alpha=0.4)
-
-        # Add Dynamic Bounding Box Margins (10% padding cushion)
-        x_buffer = (x_max - x_min) * 0.1 if x_max != x_min else 0.05
-        y_buffer = (y_max - y_min) * 0.1 if y_max != y_min else 0.05
-
-        plt.xlim(max(0, x_min - x_buffer), x_max + x_buffer)
-        plt.ylim(max(0, y_min - y_buffer), y_max + y_buffer)
-
-        # Labels & Presentation
-        plt.title("Global Mean Pressure Distribution with Channel Positions", fontweight='bold', fontsize=12)
-        plt.xlabel("Horizontal Direction /m", fontsize=11)
-        plt.ylabel("Vertical Direction /m", fontsize=11)
-
+        # Show the fully reconstructed plot
         plt.tight_layout()
         plt.show()
 
@@ -209,148 +83,233 @@ class TPU_High_Rise_Analyzer(TPU_Interface):
 
         plt.show()
 
-    def get_std_contour(self, face_no, flat_tap_coords, pressure_series):
-        return False
+    def mean_cp_contour(self, pressure_df, loc_df, face_id):
+        """
+        Generates a dedicated mean Cp contour plot for one explicitly chosen building face.
+        
+        Parameters:
+        - loc_df: DataFrame containing the raw tap coordinates ('X', 'Y', 'Point_No', 'Face_No')
+        - pressure_df: DataFrame containing the time-series wind pressure coefficients
+        - face_id: Integer (e.g., 1, 2, 5) targeting the specific face to visualize
+        """
+        # 1. Calculate the mean pressure coefficient (Cp) for each channel
+        mean_cp_series = pressure_df.mean(axis=0)
+        mean_cp_df = mean_cp_series.reset_index()
+        mean_cp_df.columns = ['Tap no.', 'mean_cp']
 
+        # 2. Map the means back to the coordinates
+        total_active_channels = pressure_df.shape[1]
+        working_df = loc_df.head(total_active_channels).copy()
+        working_df['mean_cp'] = mean_cp_df['mean_cp'].values[:total_active_channels]
 
+        # Get the global min and max Cp across the entire building to keep color scales consistent
+        vmin = working_df['mean_cp'].min()
+        vmax = working_df['mean_cp'].max()
+        levels = np.linspace(vmin, vmax, 25)
 
-class TPU_Adj_Analyzer(TPU_Interface):
-    def __init__(self, mat_path):
-        self.mat_path = mat_path
-        self.data = loadmat(mat_path)
-        self.df = None
-    
-    def get_loc_df(self):
-        loc_matrix = self.data['Location_of_measured_points']
-        loc_df = pd.DataFrame(loc_matrix.T, columns=['X', 'Y', 'Point_No', 'Face_No'])
+        # 3. Isolate the data specifically for the requested face
+        face_data = working_df[working_df['Face_No'] == face_id].copy()
+        
+        if face_data.empty:
+            print(f"❌ Error: Face {face_id} was not found in this dataset or contains no active data channels.")
+            return
 
-        # THE FIX: If coordinates are stored in millimeters (max value > 5), 
-        # convert them to standard meters automatically
-        if loc_df['X'].max() > 1.0:
-            print("⚠️ Detected millimeter units in coordinate matrix. Scaling to meters...")
-            loc_df['X'] = loc_df['X'] / 1000.0
-            loc_df['Y'] = loc_df['Y'] / 1000.0
-        return loc_df
-    
-    def get_timeseries_df(self):
-        pressure_df = pd.DataFrame(self.data['Wind_pressure_coefficients'])
-        return pressure_df
-    
-    def get_channel_plot(self, loc_df, pressure_df):
-        return False
-    
-    def view_all_steps(self, tap_no):
-        return False
-    
-    def mean_cp_contour(self, pressure_df, loc_df, face_no):
-        return False
-    
-    def std_cp_contour(self, pressure_df, loc_df, face_no):
-        return False
-    
+        # Remove any duplicate tap positions within this face zone
+        face_data = face_data.drop_duplicates(subset=['X', 'Y'])
+        
+        # We need at least 3 unique tap coordinates to calculate a 2D surface field mesh
+        if len(face_data) < 3:
+            print(f"⚠️ Face {face_id} has only {len(face_data)} unique points. Switching to 'nearest' mapping grid fallback.")
+            method_choice = 'nearest'
+        else:
+            method_choice = 'cubic'
 
-class TPU_NO_EAVE(TPU_Interface):
-    def __init__(self, mat_path):
-        self.mat_path = mat_path
-        self.data = loadmat(mat_path)
-        self.df = None
+        x = face_data['X'].values
+        y = face_data['Y'].values
+        z = face_data['mean_cp'].values
 
-    def get_loc_df(self):
-        loc_matrix = self.data['Location_of_measured_points']
-        loc_df = pd.DataFrame(loc_matrix.T, columns=['X', 'Y', 'Point_No', 'Face_No'])
+        # 4. Handle Flat 1D Profiles (e.g., if a wall face only has one straight row of sensors)
+        x_min, x_max = x.min(), x.max()
+        y_min, y_max = y.min(), y.max()
+        
+        # Nudge the mesh limits if coordinates are perfectly aligned to prevent QhullError crashes
+        if x_min == x_max:
+            x_min -= 0.01
+            x_max += 0.01
+            method_choice = 'nearest'  # Force nearest neighbor if geometrically flat
+        if y_min == y_max:
+            y_min -= 0.01
+            y_max += 0.01
+            method_choice = 'nearest'
 
-        # THE FIX: If coordinates are stored in millimeters (max value > 5), 
-        # convert them to standard meters automatically
-        if loc_df['X'].max() > 1.0:
-            print("⚠️ Detected millimeter units in coordinate matrix. Scaling to meters...")
-            loc_df['X'] = loc_df['X'] / 1000.0
-            loc_df['Y'] = loc_df['Y'] / 1000.0
-        return loc_df
-    
-    def get_timeseries_df(self):
-        pressure_df = pd.DataFrame(self.data['Wind_pressure_coefficients'])
-        return pressure_df
-    
-    def get_channel_plot(self, loc_df, pressure_df):
-        return False
-    
-    def view_all_steps(self, tap_no):
-        return False
-    
-    def mean_cp_contour(self, pressure_df, loc_df, face_no):
-        return False
-    
-    def std_cp_contour(self, pressure_df, loc_df, face_no):
-        return False
-    
+        # 5. Create a dense coordinate mesh grid for this isolated face
+        grid_x, grid_y = np.meshgrid(
+            np.linspace(x_min, x_max, 200),
+            np.linspace(y_min, y_max, 200)
+        )
 
-class TPU_WITH_EAVE(TPU_Interface):
-    def __init__(self, mat_path):
-        self.mat_path = mat_path
-        self.data = loadmat(mat_path)
-        self.df = None
+        # 6. Interpolate values locally onto the mesh grid
+        try:
+            grid_z = griddata((x, y), z, (grid_x, grid_y), method=method_choice)
+        except Exception:
+            # Emergency absolute backup if triangulation matrices break down
+            grid_z = griddata((x, y), z, (grid_x, grid_y), method='nearest')
 
-    def get_loc_df(self):
-        loc_matrix = self.data['Location_of_measured_points']
-        loc_df = pd.DataFrame(loc_matrix.T, columns=['X', 'Y', 'Point_No', 'Face_No'])
+        # =====================================================================
+        # 🎨 RENDER THE TARGET FACE CHART
+        # =====================================================================
+        plt.figure(figsize=(8, 6))
+        
+        # Plot the color filled contours
+        contour = plt.contourf(grid_x, grid_y, grid_z, levels=levels, cmap='RdBu_r', extend='both')
+        
+        # Add the colorbar scale (sharing the uniform building bounds)
+        cbar = plt.colorbar(contour)
+        cbar.set_label('Mean Pressure Coefficient ($C_p$)', fontweight='bold')
+        cbar.ax.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.1f'))
+        
+        # Overlay the exact tap locations as crisp black dots
+        plt.scatter(x, y, color='black', s=25, marker='o', alpha=0.6, label='Pressure Taps')
+        
+        # Add tap labels (Point Number indices)
+        for _, row in face_data.iterrows():
+            plt.text(row['X'], row['Y'], f" {int(row['Point_No'])}", 
+                    color='black', fontsize=8, alpha=0.8, ha='left', va='center')
 
-        # THE FIX: If coordinates are stored in millimeters (max value > 5), 
-        # convert them to standard meters automatically
-        if loc_df['X'].max() > 1.0:
-            print("⚠️ Detected millimeter units in coordinate matrix. Scaling to meters...")
-            loc_df['X'] = loc_df['X'] / 1000.0
-            loc_df['Y'] = loc_df['Y'] / 1000.0
-        return loc_df
-    
-    def get_timeseries_df(self):
-        pressure_df = pd.DataFrame(self.data['Wind_pressure_coefficients'])
-        return pressure_df
-    
-    def get_channel_plot(self, loc_df, pressure_df):
-        return False
-    
-    def view_all_steps(self, tap_no):
-        return False
-    
-    def mean_cp_contour(self, pressure_df, loc_df, face_no):
-        return False
-    
-    def std_cp_contour(self, pressure_df, loc_df, face_no):
-        return False
-    
-class TPU_LOW_RISE(TPU_Interface):
-    def __init__(self, mat_path):
-        self.mat_path = mat_path
-        self.data = loadmat(mat_path)
-        self.df = None
+        # Formatting presentation layers
+        plt.title(f"Mean Pressure Coefficient Contour Field - Face {face_id}", fontweight='bold', fontsize=12)
+        plt.xlabel("X Local Coordinate", fontsize=10)
+        plt.ylabel("Y Local Coordinate", fontsize=10)
+        plt.grid(True, linestyle=':', alpha=0.5)
+        ax = plt.gca()
 
-    def get_loc_df(self):
-        loc_matrix = self.data['Location_of_measured_points']
-        loc_df = pd.DataFrame(loc_matrix.T, columns=['X', 'Y', 'Point_No', 'Face_No'])
+        # 1. Get the current camera limits
+        xmin, xmax = ax.get_xlim()
+        ymin, ymax = ax.get_ylim()
 
-        # THE FIX: If coordinates are stored in millimeters (max value > 5), 
-        # convert them to standard meters automatically
-        if loc_df['X'].max() > 1.0:
-            print("⚠️ Detected millimeter units in coordinate matrix. Scaling to meters...")
-            loc_df['X'] = loc_df['X'] / 1000.0
-            loc_df['Y'] = loc_df['Y'] / 1000.0
-        return loc_df
-    
-    def get_timeseries_df(self):
-        pressure_df = pd.DataFrame(self.data['Wind_pressure_coefficients'])
-        return pressure_df
-    
-    def get_channel_plot(self, loc_df, pressure_df):
-        return False
-    
-    def view_all_steps(self, tap_no):
-        return False
-    
-    def mean_cp_contour(self, pressure_df, loc_df, face_no):
-        return False
-    
-    def std_cp_contour(self, pressure_df, loc_df, face_no):
-        return False
+        # 2. Define your "little bit" padding amount
+        pad_x = 0.005
+        pad_y = 0.005
 
+        # 3. Apply the shift to expand outwards
+        ax.set_xlim(xmin - pad_x, xmax + pad_x)
+        ax.set_ylim(ymin - pad_y, ymax + pad_y)
 
+        
+        plt.tight_layout()
+        plt.show()
     
+    def std_cp_contour(self, pressure_df, loc_df, face_id):
+        """
+        Generates a dedicated standard deviation Cp contour plot for one explicitly chosen building face.
+        
+        Parameters:
+        - loc_df: DataFrame containing the raw tap coordinates ('X', 'Y', 'Point_No', 'Face_No')
+        - pressure_df: DataFrame containing the time-series wind pressure coefficients
+        - face_id: Integer (e.g., 1, 2, 5) targeting the specific face to visualize
+        """
+        # 1. CHANGE: Calculate the Standard Deviation (std) for each channel instead of the mean
+        std_cp_series = pressure_df.std(axis=0)
+        std_cp_df = std_cp_series.reset_index()
+        std_cp_df.columns = ['Tap no.', 'std_cp']
+
+        # 2. Map the standard deviations back to the coordinates
+        total_active_channels = pressure_df.shape[1]
+        working_df = loc_df.head(total_active_channels).copy()
+        working_df['std_cp'] = std_cp_df['std_cp'].values[:total_active_channels]
+
+        # Get the global min and max Cp across the entire building to keep color scales consistent
+        vmin = working_df['std_cp'].min()
+        vmax = working_df['std_cp'].max()
+        levels = np.linspace(vmin, vmax, 25)
+
+        # 3. Isolate the data specifically for the requested face
+        face_data = working_df[working_df['Face_No'] == face_id].copy()
+        
+        if face_data.empty:
+            print(f"❌ Error: Face {face_id} was not found in this dataset or contains no active data channels.")
+            return
+
+        # Remove any duplicate tap positions within this face zone
+        face_data = face_data.drop_duplicates(subset=['X', 'Y'])
+        
+        # We need at least 3 unique tap coordinates to calculate a 2D surface field mesh
+        if len(face_data) < 3:
+            print(f"⚠️ Face {face_id} has only {len(face_data)} unique points. Switching to 'nearest' mapping grid fallback.")
+            method_choice = 'nearest'
+        else:
+            method_choice = 'cubic'
+
+        x = face_data['X'].values
+        y = face_data['Y'].values
+        z = face_data['std_cp'].values  # CHANGE: Using std values here
+
+        # 4. Handle Flat 1D Profiles (e.g., if a wall face only has one straight row of sensors)
+        x_min, x_max = x.min(), x.max()
+        y_min, y_max = y.min(), y.max()
+        
+        # Nudge the mesh limits if coordinates are perfectly aligned to prevent QhullError crashes
+        if x_min == x_max:
+            x_min -= 0.01
+            x_max += 0.01
+            method_choice = 'nearest'  # Force nearest neighbor if geometrically flat
+        if y_min == y_max:
+            y_min -= 0.01
+            y_max += 0.01
+            method_choice = 'nearest'
+
+        # 5. Create a dense coordinate mesh grid for this isolated face
+        grid_x, grid_y = np.meshgrid(
+            np.linspace(x_min, x_max, 200),
+            np.linspace(y_min, y_max, 200)
+        )
+
+        # 6. Interpolate values locally onto the mesh grid
+        try:
+            grid_z = griddata((x, y), z, (grid_x, grid_y), method=method_choice)
+        except Exception:
+            # Emergency absolute backup if triangulation matrices break down
+            grid_z = griddata((x, y), z, (grid_x, grid_y), method='nearest')
+
+        # =====================================================================
+        # 🎨 RENDER THE TARGET FACE CHART
+        # =====================================================================
+        plt.figure(figsize=(8, 6))
+        
+        # CHANGE: Switched cmap to 'YlOrRd' because standard deviation is always positive turbulence
+        contour = plt.contourf(grid_x, grid_y, grid_z, levels=levels, cmap='YlOrRd', extend='both')
+        
+        # Add the colorbar scale (sharing the uniform building bounds)
+        cbar = plt.colorbar(contour)
+        # CHANGE: Label updated to reflect Standard Deviation
+        cbar.set_label('Std Dev of Pressure Coefficient ($C_p$)', fontweight='bold')
+        cbar.ax.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.2f'))
+        
+        # Overlay the exact tap locations as crisp black dots
+        plt.scatter(x, y, color='black', s=25, marker='o', alpha=0.6, label='Pressure Taps')
+        
+        # Add tap labels (Point Number indices)
+        for _, row in face_data.iterrows():
+            plt.text(row['X'], row['Y'], f" {int(row['Point_No'])}", 
+                    color='black', fontsize=8, alpha=0.8, ha='left', va='center')
+
+        # Formatting presentation layers
+        # CHANGE: Title updated to reflect Standard Deviation
+        plt.title(f"Std Dev Pressure Coefficient Contour Field - Face {face_id}", fontweight='bold', fontsize=12)
+        plt.xlabel("X Local Coordinate", fontsize=10)
+        plt.ylabel("Y Local Coordinate", fontsize=10)
+        plt.grid(True, linestyle=':', alpha=0.5)
+        
+        # Camera adjustments (Keeps your custom dynamic camera zoom out padding)
+        ax = plt.gca()
+        xmin, xmax = ax.get_xlim()
+        ymin, ymax = ax.get_ylim()
+
+        pad_x = 0.005  
+        pad_y = 0.005
+
+        ax.set_xlim(xmin - pad_x, xmax + pad_x)
+        ax.set_ylim(ymin - pad_y, ymax + pad_y)
+        
+        plt.tight_layout()
+        plt.show()

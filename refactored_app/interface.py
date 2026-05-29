@@ -3,11 +3,19 @@ from abc import ABC, abstractmethod
 class TPU_Interface(ABC):
 
     @abstractmethod
+    def get_loc_df(self):
+        pass
+
+    @abstractmethod
+    def get_timeseries_df(self):
+        pass
+
+    @abstractmethod
     def get_channel_plot(self, loc_df, pressure_df):
         pass
 
     @abstractmethod
-    def view_all_steps(self, tap_no):
+    def view_all_steps(self, pressure_df, tap_no):
         pass
 
     @abstractmethod
@@ -15,7 +23,7 @@ class TPU_Interface(ABC):
         pass
 
     @abstractmethod
-    def std_cp_contour(self, pressure_df, face_no):
+    def std_cp_contour(self, pressure_df, loc_df, face_no):
         pass
 
 
