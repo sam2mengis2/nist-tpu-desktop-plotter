@@ -2,3 +2,4 @@ __pycache__/
 aerodb_env/
 .vscode/
 TPU_TEST_FILES/
+wind_tunnel_pipeline\downloads/
