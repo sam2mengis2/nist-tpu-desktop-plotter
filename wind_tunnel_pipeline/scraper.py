@@ -21,7 +21,7 @@ import os
 import pandas as pd
 # --- CONFIGURATION ---
 DB_PASSWORD = "$Web4now$03"
-DOWNLOAD_DIR = "C:\FINAL_SUMMER_PROJ\wind_tunnel_pipeline"
+DOWNLOAD_DIR = "/home/azureuser/wind_tunnel_pipeline"
 
 def get_db_connection():
     return psycopg2.connect(
@@ -184,10 +184,11 @@ def push_to_supabase(hdf_filename, df_taps, df_pressure):
         
         # 💡 THE FIX: Safely catch whichever key name you used in your filename parser!
         actual_angle = meta.get('wind_angle', meta.get('angle', 0.0))
-        
+        data_origin_val = 'NIST'
+
         cur.execute("""
-            INSERT INTO "NIST_Table" (roof_slope, exposure_val, model_scale, leakage, eave_height, angle)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            INSERT INTO "Origin_Table" (roof_slope, exposure_val, model_scale, leakage, eave_height, angle, data_origin)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             RETURNING id;
         """, (
             meta['roof_slope'], 
@@ -195,7 +196,8 @@ def push_to_supabase(hdf_filename, df_taps, df_pressure):
             meta['model_scale'], 
             meta['leakage'], 
             meta['eave_height'],
-            actual_angle  # Drops cleanly into your 'angle' column
+            actual_angle,  # Drops cleanly into your 'angle' column
+            data_origin_val
         ))
         
         model_id = cur.fetchone()[0]
