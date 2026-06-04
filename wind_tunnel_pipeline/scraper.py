@@ -11,7 +11,7 @@ from pyhdf.SD import SD, SDC
 
 # --- CONFIGURATION ---
 DB_PASSWORD = "$Web4now$03"
-DOWNLOAD_DIR = "/home/azureuser/wind_tunnel_pipeline"  # Optimized Linux Path
+DOWNLOAD_DIR = "/home/azureuser/wind_tunnel_pipeline"
 
 def get_db_connection():
     return psycopg2.connect(
@@ -23,30 +23,35 @@ def get_db_connection():
     )
 
 # ==========================================
-# PHASE 1: SCRAPE & DOWNLOAD
+# PHASE 1: LINK HARVESTING & STREAMING
 # ==========================================
-def fetch_nist_dataset(page_url):
-    """Finds the dataset link and streams it to disk with clear chunk telemetry."""
-    print(f"Scraping {page_url}...")
+def get_all_nist_zip_urls(page_url):
+    """Scrapes the page and gathers every unique .zip download link available in the data tables."""
+    print(f"Scraping page index for all datasets: {page_url}...")
     response = requests.get(page_url, timeout=30)
     soup = BeautifulSoup(response.text, 'html.parser')
 
-    # Find the zip anchor tag
-    link = soup.find('a', href=lambda href: href and '.zip' in href.lower())
-    if not link:
-        raise Exception(f"Could not find any .zip download links on {page_url}")
-        
-    zip_url = link['href']
-    if zip_url.startswith('/'):
-        zip_url = "https://www.nist.gov" + zip_url
+    # Find every anchor tag that references a .zip archive
+    anchors = soup.find_all('a', href=lambda href: href and '.zip' in href.lower())
+    
+    zip_urls = []
+    for anchor in anchors:
+        url = anchor['href']
+        if url.startswith('/'):
+            url = "https://www.nist.gov" + url
+        if url not in zip_urls:
+            zip_urls.append(url)
+            
+    print(f"🎯 Successfully harvested {len(zip_urls)} unique master dataset links from the page tables.")
+    return zip_urls
 
+def download_single_zip(zip_url):
+    """Streams a single target zip file to the local SSD cache layer."""
     file_name = zip_url.split('/')[-1].split('?')[0]
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     save_path = os.path.join(DOWNLOAD_DIR, file_name)
 
-    print(f"\n[TELEMETRY] Target Download URL: {zip_url}")
-    print(f"Streaming to disk...")
-    
+    print(f"\n[STREAMING] Downloading: {file_name}")
     with requests.get(zip_url, stream=True, timeout=(10, 30)) as r:
         r.raise_for_status()
         chunk_count = 0
@@ -55,11 +60,11 @@ def fetch_nist_dataset(page_url):
                 if chunk:
                     f.write(chunk)
                     chunk_count += 1
-                    if chunk_count % 250 == 0:
-                        print(f"   -> Progress: {chunk_count * 4096 / 1024 / 1024:.1f} MB written to disk...", end="\r")
+                    if chunk_count % 500 == 0:
+                        print(f"   -> Progress: {chunk_count * 4096 / 1024 / 1024:.1f} MB compiled...", end="\r")
                         
-    print(f"\n✅ Download complete: {file_name}")
-    return save_path, file_name
+    print(f"\n downloaded: {file_name}")
+    return save_path
 
 # ==========================================
 # PHASE 2: FILENAME PARSER
@@ -86,30 +91,23 @@ def parse_nist_filename(file_path):
         return None
 
 # ==========================================
-# PHASE 3: FEATURE MATRIX MATRIX TRANSFORMATION
+# PHASE 3: FEATURE MATRIX TRANSFORMATION
 # ==========================================
 def parse_single_hdf4_file(file_path):
-    """
-    Extracts spatial components and compresses temporal arrays into 6 statistical 
-    moments and 32 low-frequency Real FFT coefficients natively.
-    """
+    """Extracts spatial layout and compresses temporal arrays into statistical & FFT features."""
     hdf = None
     try:
         hdf = SD(file_path, SDC.READ)
         
-        # --- 1. EXTRACT SPATIAL COORDINATES ---
+        # --- 1. SPATIAL DATA FRAMING ---
         coords_matrix = hdf.select('Flat_Tap_Coordinates')[:] 
         tap_labels_spatial = coords_matrix[0, :].astype(int).astype(str)
         x_vector = coords_matrix[2, :].astype(float)
         y_vector = coords_matrix[3, :].astype(float)
         
-        df_spatial = pd.DataFrame({
-            "tap_no": tap_labels_spatial,
-            "x": x_vector,
-            "y": y_vector
-        })
+        df_spatial = pd.DataFrame({"tap_no": tap_labels_spatial, "x": x_vector, "y": y_vector})
         
-        # --- 2. EXTRACT TIME-SERIES AND REDUCE FEATURES ---
+        # --- 2. TIME-SERIES FEATURE REDUCTION ---
         pressure_matrix = hdf.select('Time_Series')[:] 
         ts_labels_matrix = hdf.select('Tap_Position_List')[:] 
         
@@ -125,183 +123,156 @@ def parse_single_hdf4_file(file_path):
             timeline_arr = np.array(pressure_matrix[index, :])
             ts_series = pd.Series(timeline_arr)
             
-            # Extract high-value statistical parameters
             mean_val = float(np.mean(timeline_arr))
             std_val = float(np.std(timeline_arr))
             min_val = float(np.min(timeline_arr))
             max_val = float(np.max(timeline_arr))
-            
-            # Handle edge cases for perfectly static values gracefully
             skew_val = float(ts_series.skew()) if not pd.isna(ts_series.skew()) else 0.0
             kurt_val = float(ts_series.kurtosis()) if not pd.isna(ts_series.kurtosis()) else 0.0
             
-            # Extract dominant low-frequency macro macro dynamics via Real FFT
             fft_magnitudes = np.abs(np.fft.rfft(timeline_arr))
             top_32_frequencies = fft_magnitudes[:32].tolist()
             
             series_records.append({
-                "tap_no": label,
-                "mean_cp": mean_val,
-                "stddev_cp": std_val,
-                "min_cp": min_val,
-                "max_cp": max_val,
-                "skew_cp": skew_val,
-                "kurtosis_cp": kurt_val,
-                "fft_magnitude": top_32_frequencies
+                "tap_no": label, "mean_cp": mean_val, "stddev_cp": std_val,
+                "min_cp": min_val, "max_cp": max_val, "skew_cp": skew_val,
+                "kurtosis_cp": kurt_val, "fft_magnitude": top_32_frequencies
             })
             
-        df_series = pd.DataFrame(series_records)
-        return df_spatial, df_series
-        
+        return df_spatial, pd.DataFrame(series_records)
     except Exception as error:
         print(f"Failed parsing HDF4 structure in {os.path.basename(file_path)}: {error}")
         return None, None
     finally:
-        if hdf:
-            hdf.end()
+        if hdf: hdf.end()
 
 # ==========================================
-# PHASE 4: RELATIONAL INGESTION ENGINE
+# PHASE 4: DB INGESTION
 # ==========================================
 def push_to_supabase(hdf_filename, df_taps, df_pressure):
-    """Handles the 3-tier relational upload matching the clean schema."""
+    """Inserts processed layout and feature tables into Supabase relational structure."""
     conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # --- STEP A: Create Parent Metadata Record ---
-        print(f"\n1. Creating Parent Record in Origin_Table...")
         meta = parse_nist_filename(hdf_filename)
-        if not meta:
-            raise Exception("Failed to parse metadata. Pipeline halted.")
+        if not meta: raise Exception("Failed to parse metadata.")
         
-        data_origin_val = 'NIST'
-
+        # Parent Insertion
         cur.execute("""
             INSERT INTO "Origin_Table" (roof_slope, exposure_val, model_scale, leakage, eave_height, angle, data_origin)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            RETURNING id;
-        """, (
-            meta['roof_slope'], 
-            meta['exposure_val'], 
-            meta['model_scale'], 
-            meta['leakage'], 
-            meta['eave_height'],
-            meta['angle'],
-            data_origin_val
-        ))
+            VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id;
+        """, (meta['roof_slope'], meta['exposure_val'], meta['model_scale'], meta['leakage'], meta['eave_height'], meta['angle'], 'NIST'))
         
         model_id = cur.fetchone()[0]
-        print(f"   -> Parent created with ID: {model_id} at {meta['angle']}°")
 
-        # --- STEP B: Upload Spatial Taps ---
-        print("2. Uploading Spatial Taps...")
+        # Spatial Taps Insertion
         df_taps['model_id'] = model_id
-        
-        tap_insert_query = """
-            INSERT INTO taps (model_id, tap_no, x, y) 
-            VALUES %s
-            RETURNING id, tap_no;
-        """
+        tap_insert_query = "INSERT INTO taps (model_id, tap_no, x, y) VALUES %s RETURNING id, tap_no;"
         tap_values = [tuple(x) for x in df_taps[['model_id', 'tap_no', 'x', 'y']].to_numpy()]
-        
         inserted_taps = execute_values(cur, tap_insert_query, tap_values, fetch=True)
         tap_id_map = {row[1]: row[0] for row in inserted_taps}
-        print(f"   -> Successfully linked {len(tap_id_map)} spatial taps.")
 
-        # --- STEP C: Upload Optimized Feature Records ---
-        print("3. Uploading Pressure Feature Metrics...")
+        # Features Vector Insertion
         df_pressure['tap_id'] = df_pressure['tap_no'].map(tap_id_map)
-        
         pressure_insert_query = """
             INSERT INTO pressure_series (tap_id, mean_cp, stddev_cp, min_cp, max_cp, skew_cp, kurtosis_cp, fft_magnitude)
             VALUES %s;
         """
-        
         pressure_columns = ['tap_id', 'mean_cp', 'stddev_cp', 'min_cp', 'max_cp', 'skew_cp', 'kurtosis_cp', 'fft_magnitude']
         pressure_values = [tuple(x) for x in df_pressure[pressure_columns].to_numpy()]
         
-        # Aggressive batch sizes are safe since rows are tiny (no massive raw arrays)
         BATCH_SIZE = 100
-        total_rows = len(pressure_values)
-        
-        for start_idx in range(0, total_rows, BATCH_SIZE):
-            end_idx = min(start_idx + BATCH_SIZE, total_rows)
-            batch = pressure_values[start_idx:end_idx]
-            
-            print(f"   -> Transmitting rows {start_idx} to {end_idx} of {total_rows}...   ", end="\r")
-            execute_values(cur, pressure_insert_query, batch)
+        for start_idx in range(0, len(pressure_values), BATCH_SIZE):
+            end_idx = min(start_idx + BATCH_SIZE, len(pressure_values))
+            execute_values(cur, pressure_insert_query, pressure_values[start_idx:end_idx])
             conn.commit() 
             
-        print(f"\n   -> Successfully uploaded all {total_rows} feature records.")
-        print(f"✅ Clean run for {os.path.basename(hdf_filename)} committed completely!")
-
     except Exception as e:
         print(f"Database Error: {e}")
-        if conn:
-            conn.rollback()
+        if conn: conn.rollback()
     finally:
         if conn:
             cur.close()
             conn.close()
 
 # ==========================================
-# MAIN EXECUTION LOOP
+# MASTER AUTOMATION EXECUTION LOOP
 # ==========================================
 if __name__ == "__main__":
     NIST_PAGE_URL = "https://www.nist.gov/el/mssd/nist-aerodynamic-database/university-western-ontario-data-sets/data-sets-test-number#data-sets-from-phase-1"
     
     try:
-        print("--- STARTING AUTOMATED PIPELINE ---")
+        print("--- STARTING MASTER DISTRIBUTED AUTOMATION PIPELINE ---")
         
-        # 1. Stream master archive
-        zip_path, _ = fetch_nist_dataset(NIST_PAGE_URL)
+        # 1. Harvest every master dataset link visible on the webpage
+        master_zip_urls = get_all_nist_zip_urls(NIST_PAGE_URL)
         
-        # 2. Extract into safe, self-cleaning staging disk space
-        print("\n--- UNPACKING DATASETS ---")
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with zipfile.ZipFile(zip_path, 'r') as master_zip:
-                master_zip.extractall(temp_dir)
+        # 2. Sequential Processing Loop
+        for index, target_url in enumerate(master_zip_urls, 1):
+            filename_zip = target_url.split('/')[-1].split('?')[0]
             
-            nested_zips = []
-            for root, dirs, files in os.walk(temp_dir):
-                for file in files:
-                    if file.lower().endswith(".zip"):
-                        nested_zips.append(os.path.join(root, file))
+            # 💡 THE GUARD CLAUSE: Instantly skip ee1.zip processing
+            if "ee1" in filename_zip.lower():
+                print(f"\n⏭️ Skipping batch entry {index} ({filename_zip}) because it is already ingested.")
+                continue
+                
+            print(f"\n==================================================================")
+            print(f"PROCESSING BATCH ENTRY {index} OF {len(master_zip_urls)}")
+            print(f"Target: {filename_zip}")
+            print(f"==================================================================")
             
-            if nested_zips:
-                print(f"Found {len(nested_zips)} nested ZIP archives. Unpacking maps...")
-                for n_zip in nested_zips:
-                    with zipfile.ZipFile(n_zip, 'r') as nested_archive:
-                        nested_archive.extractall(os.path.dirname(n_zip))
-            
-            hdf_files = []
-            for root, dirs, files in os.walk(temp_dir):
-                for file in files:
-                    if file.upper().endswith(".HDF"):
-                        hdf_files.append(os.path.join(root, file))
+            local_zip_path = None
+            try:
+                # Step A: Download the single master zip archive
+                local_zip_path = download_single_zip(target_url)
+                
+                # Step B: Unpack, calculate features, and stream to Supabase
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    with zipfile.ZipFile(local_zip_path, 'r') as master_zip:
+                        master_zip.extractall(temp_dir)
+                    
+                    nested_zips = []
+                    for root, _, files in os.walk(temp_dir):
+                        for file in files:
+                            if file.lower().endswith(".zip"):
+                                nested_zips.append(os.path.join(root, file))
+                    
+                    if nested_zips:
+                        for n_zip in nested_zips:
+                            with zipfile.ZipFile(n_zip, 'r') as nested_archive:
+                                nested_archive.extractall(os.path.dirname(n_zip))
+                    
+                    hdf_files = []
+                    for root, _, files in os.walk(temp_dir):
+                        for file in files:
+                            if file.upper().endswith(".HDF"):
+                                hdf_files.append(os.path.join(root, file))
+                    
+                    print(f" -> Found {len(hdf_files)} aerodynamic files inside this dataset archive.")
+                    
+                    for hdf_path in sorted(hdf_files):
+                        filename = os.path.basename(hdf_path)
+                        print(f"    -> Parsing matrices: {filename}...", end="\r")
                         
-            if not hdf_files:
-                raise Exception("No .HDF files found in the extracted archive.")
-            
-            print(f"Found {len(hdf_files)} .HDF files for different wind angles.")
-            print("\n--- PARSING & RELATIONAL DATABASE INGESTION ---")
-            
-            # Sort files so they run sequentially from 0 to 360 degrees
-            for hdf_path in sorted(hdf_files):
-                filename = os.path.basename(hdf_path)
-                print(f"\nProcessing target: {filename}")
+                        df_taps, df_pressure = parse_single_hdf4_file(hdf_path)
+                        if df_taps is None or df_pressure is None:
+                            continue
+                            
+                        push_to_supabase(hdf_path, df_taps, df_pressure)
                 
-                df_taps, df_pressure = parse_single_hdf4_file(hdf_path) 
+                print(f"✅ Master dataset {index} successfully uploaded completely.")
                 
-                if df_taps is None or df_pressure is None:
-                    print(f"⚠️ Warning: {filename} data parsing failed. Skipping.")
-                    continue
+            except Exception as item_error:
+                print(f"⚠️ Error running dataset bundle {target_url}: {item_error}")
                 
-                push_to_supabase(hdf_path, df_taps, df_pressure)
-                
-        print("\n✅ PIPELINE COMPLETE! Temporary storage flushed. Database fully populated.")
+            finally:
+                if local_zip_path and os.path.exists(local_zip_path):
+                    os.remove(local_zip_path)
+                    print(f"🧹 Local cache cleared: Removed {os.path.basename(local_zip_path)} from server disk.")
+                    
+        print("\n🏆 GLOBAL DATA EXTRACTION COMPLETE! Entire NIST Phase 1 table ingested.")
         
     except Exception as e:
-        print(f"\n❌ Pipeline crashed: {e}")
+        print(f"\n❌ Global Pipeline Failure: {e}")
