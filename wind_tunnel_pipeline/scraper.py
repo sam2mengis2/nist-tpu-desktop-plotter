@@ -8,19 +8,73 @@ import psycopg2
 from psycopg2.extras import execute_values
 from bs4 import BeautifulSoup
 from pyhdf.SD import SD, SDC
+#cockroach db Password is S2E8zH83RkfwAG5THekg4w
+
 
 # --- CONFIGURATION ---
-DB_PASSWORD = "$Web4now$03"
+# Replace this with the exact Connection String provided by your Cockroach dashboard
+COCKROACH_DB_URL = "postgresql://Samuel:S2E8zH83RkfwAG5THekg4w@active-slug-1234.gcp-us-east1.cockroachlabs.cloud:26257/defaultdb?sslmode=verify-full"
 DOWNLOAD_DIR = "/home/azureuser/wind_tunnel_pipeline"
 
 def get_db_connection():
-    return psycopg2.connect(
-        host="aws-1-us-east-1.pooler.supabase.com",
-        port="5432",
-        database="postgres",
-        user="postgres.nanddzdspaucmwlyoyoc",
-        password=DB_PASSWORD
-    )
+    """Establishes a connection to the CockroachDB serverless cloud cluster."""
+    return psycopg2.connect(COCKROACH_DB_URL)
+
+
+
+def init_cockroach_tables():
+    """Verifies and automatically constructs the cloud relational schemas if they do not exist."""
+    print("Checking cloud infrastructure state on CockroachDB...")
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # 1. Master Metadata Layout Table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS "Origin_Table" (
+            id INT8 PRIMARY KEY DEFAULT unique_row_id(),
+            roof_slope INT NOT NULL,
+            exposure_val TEXT NOT NULL,
+            model_scale INT NOT NULL,
+            leakage TEXT NOT NULL,
+            eave_height INT NOT NULL,
+            angle FLOAT NOT NULL,
+            data_origin TEXT DEFAULT 'NIST',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    
+    # 2. Spatial Coordinate Table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS taps (
+            id INT8 PRIMARY KEY DEFAULT unique_row_id(),
+            model_id INT8 NOT NULL REFERENCES "Origin_Table"(id) ON DELETE CASCADE,
+            tap_no TEXT NOT NULL,
+            x FLOAT NOT NULL,
+            y FLOAT NOT NULL,
+            CONSTRAINT unique_model_tap UNIQUE(model_id, tap_no)
+        );
+    """)
+    
+    # 3. Compressed Time-Series Metrics Table
+    # Note: CockroachDB handles Postgres FLOAT[] arrays natively!
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pressure_series (
+            id INT8 PRIMARY KEY DEFAULT unique_row_id(),
+            tap_id INT8 NOT NULL UNIQUE REFERENCES taps(id) ON DELETE CASCADE,
+            mean_cp FLOAT NOT NULL,
+            stddev_cp FLOAT NOT NULL,
+            min_cp FLOAT NOT NULL,
+            max_cp FLOAT NOT NULL,
+            skew_cp FLOAT,
+            kurtosis_cp FLOAT,
+            fft_magnitude FLOAT[] NOT NULL 
+        );
+    """)
+    
+    conn.commit()
+    cur.close()
+    conn.close()
+    print("✅ Cloud database tables verified and locked down.")
 
 # ==========================================
 # PHASE 1: LINK HARVESTING & STREAMING
@@ -31,7 +85,6 @@ def get_all_nist_zip_urls(page_url):
     response = requests.get(page_url, timeout=30)
     soup = BeautifulSoup(response.text, 'html.parser')
 
-    # Find every anchor tag that references a .zip archive
     anchors = soup.find_all('a', href=lambda href: href and '.zip' in href.lower())
     
     zip_urls = []
@@ -147,10 +200,10 @@ def parse_single_hdf4_file(file_path):
         if hdf: hdf.end()
 
 # ==========================================
-# PHASE 4: DB INGESTION
+# PHASE 4: DB INGESTION ENGINE
 # ==========================================
-def push_to_supabase(hdf_filename, df_taps, df_pressure):
-    """Inserts processed layout and feature tables into Supabase relational structure."""
+def push_to_cockroach(hdf_filename, df_taps, df_pressure):
+    """Inserts processed layout and feature tables into CockroachDB relational structure."""
     conn = None
     try:
         conn = get_db_connection()
@@ -159,7 +212,7 @@ def push_to_supabase(hdf_filename, df_taps, df_pressure):
         meta = parse_nist_filename(hdf_filename)
         if not meta: raise Exception("Failed to parse metadata.")
         
-        # Parent Insertion
+        # Parent Table Insertion
         cur.execute("""
             INSERT INTO "Origin_Table" (roof_slope, exposure_val, model_scale, leakage, eave_height, angle, data_origin)
             VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id;
@@ -174,7 +227,7 @@ def push_to_supabase(hdf_filename, df_taps, df_pressure):
         inserted_taps = execute_values(cur, tap_insert_query, tap_values, fetch=True)
         tap_id_map = {row[1]: row[0] for row in inserted_taps}
 
-        # Features Vector Insertion
+        # Compressed Features Vector Ingestion
         df_pressure['tap_id'] = df_pressure['tap_no'].map(tap_id_map)
         pressure_insert_query = """
             INSERT INTO pressure_series (tap_id, mean_cp, stddev_cp, min_cp, max_cp, skew_cp, kurtosis_cp, fft_magnitude)
@@ -183,6 +236,7 @@ def push_to_supabase(hdf_filename, df_taps, df_pressure):
         pressure_columns = ['tap_id', 'mean_cp', 'stddev_cp', 'min_cp', 'max_cp', 'skew_cp', 'kurtosis_cp', 'fft_magnitude']
         pressure_values = [tuple(x) for x in df_pressure[pressure_columns].to_numpy()]
         
+        # Batch size adjusted to optimize cloud transmission over serverless nodes
         BATCH_SIZE = 100
         for start_idx in range(0, len(pressure_values), BATCH_SIZE):
             end_idx = min(start_idx + BATCH_SIZE, len(pressure_values))
@@ -190,7 +244,7 @@ def push_to_supabase(hdf_filename, df_taps, df_pressure):
             conn.commit() 
             
     except Exception as e:
-        print(f"Database Error: {e}")
+        print(f"Database Ingestion Failure: {e}")
         if conn: conn.rollback()
     finally:
         if conn:
@@ -204,19 +258,16 @@ if __name__ == "__main__":
     NIST_PAGE_URL = "https://www.nist.gov/el/mssd/nist-aerodynamic-database/university-western-ontario-data-sets/data-sets-test-number#data-sets-from-phase-1"
     
     try:
-        print("--- STARTING MASTER DISTRIBUTED AUTOMATION PIPELINE ---")
+        print("--- STARTING COCKROACHDB SERVERLESS PIPELINE ---")
         
+        init_cockroach_tables()
+
         # 1. Harvest every master dataset link visible on the webpage
         master_zip_urls = get_all_nist_zip_urls(NIST_PAGE_URL)
         
         # 2. Sequential Processing Loop
         for index, target_url in enumerate(master_zip_urls, 1):
             filename_zip = target_url.split('/')[-1].split('?')[0]
-            
-            # 💡 THE GUARD CLAUSE: Instantly skip ee1.zip processing
-            if "ee1" in filename_zip.lower():
-                print(f"\n⏭️ Skipping batch entry {index} ({filename_zip}) because it is already ingested.")
-                continue
                 
             print(f"\n==================================================================")
             print(f"PROCESSING BATCH ENTRY {index} OF {len(master_zip_urls)}")
@@ -225,10 +276,8 @@ if __name__ == "__main__":
             
             local_zip_path = None
             try:
-                # Step A: Download the single master zip archive
                 local_zip_path = download_single_zip(target_url)
                 
-                # Step B: Unpack, calculate features, and stream to Supabase
                 with tempfile.TemporaryDirectory() as temp_dir:
                     with zipfile.ZipFile(local_zip_path, 'r') as master_zip:
                         master_zip.extractall(temp_dir)
@@ -254,13 +303,13 @@ if __name__ == "__main__":
                     
                     for hdf_path in sorted(hdf_files):
                         filename = os.path.basename(hdf_path)
-                        print(f"    -> Parsing matrices: {filename}...", end="\r")
+                        print(f"    -> Ingesting matrices into cloud: {filename}...", end="\r")
                         
                         df_taps, df_pressure = parse_single_hdf4_file(hdf_path)
                         if df_taps is None or df_pressure is None:
                             continue
                             
-                        push_to_supabase(hdf_path, df_taps, df_pressure)
+                        push_to_cockroach(hdf_path, df_taps, df_pressure)
                 
                 print(f"✅ Master dataset {index} successfully uploaded completely.")
                 
@@ -272,7 +321,7 @@ if __name__ == "__main__":
                     os.remove(local_zip_path)
                     print(f"🧹 Local cache cleared: Removed {os.path.basename(local_zip_path)} from server disk.")
                     
-        print("\n🏆 GLOBAL DATA EXTRACTION COMPLETE! Entire NIST Phase 1 table ingested.")
+        print("\n🏆 GLOBAL DATA EXTRACTION COMPLETE! Entire database successfully populated.")
         
     except Exception as e:
         print(f"\n❌ Global Pipeline Failure: {e}")
