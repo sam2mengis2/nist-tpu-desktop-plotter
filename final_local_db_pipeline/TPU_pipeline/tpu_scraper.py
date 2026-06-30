@@ -1,3 +1,9 @@
+# -*- coding: utf-8 -*-
+"""
+tpu_scraper.py - Automated Multi-Category File-Drop Engine
+Crawls the TPU wind tunnel database and downloads target .mat files directly to a file drop folder.
+"""
+
 import os
 import re
 import ssl
@@ -7,17 +13,16 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
 
-# Import your database function from your existing script
-from TPU_parser import populate_database_from_mat
+# 🎯 TARGET FILE DROP PATH (Raw string used to safely handle Windows backslashes)
+DROP_PATH = r"C:\FINAL_SUMMER_PROJ\final_local_db_pipeline\file_drop"
 
-# Catalog of primary TPU database landing portals based on your directory map
+# Catalog of primary TPU database landing portals
 PORTAL_CATALOG = {
     "High-Rise Buildings (Isolated Building)": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/highrise/Homepage/homepageHDF.htm",
-    "Low-Rise Buildings (Isolated Building)": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/lowrise/mainpage.html",
-    "Low-Rise Buildings with Eaves": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/lowriseeave/mainpage.html",
-    "Low-Rise Buildings (Non-Isolated)": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/grouplowrise/mainpage.html"
-
+    "Low-Rise Buildings (Isolated Building)": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/lowrise/Homepage/homepageLDF.htm",
+    "Low-Rise Buildings with Eaves": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/eaves/Homepage/homepageEDF.htm",
 }
+
 
 class LegacySSLAdapter(HTTPAdapter):
     """Bypasses weak Diffie-Hellman handshakes on legacy academic servers."""
@@ -30,6 +35,7 @@ class LegacySSLAdapter(HTTPAdapter):
             num_pools=connections, maxsize=maxsize, block=block, ssl_context=ctx, **pool_kwargs
         )
 
+
 def create_legacy_session():
     """Returns a requests session configured for older server architectures."""
     session = requests.Session()
@@ -37,6 +43,7 @@ def create_legacy_session():
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
+
 
 def find_dropdown_recursively(session, url, headers, visited=None):
     """Scans the current URL and nested framesets to locate either 'mysel' or 'urlsel' dropdowns."""
@@ -54,7 +61,6 @@ def find_dropdown_recursively(session, url, headers, visited=None):
 
     soup = BeautifulSoup(response.text, "html.parser")
     
-    # Look for 'mysel' first. If it's missing, look for the 'urlsel' tag configuration
     select_tag = soup.find("select", attrs={"name": "mysel"})
     if not select_tag:
         select_tag = soup.find("select", attrs={"name": "urlsel"})
@@ -62,7 +68,6 @@ def find_dropdown_recursively(session, url, headers, visited=None):
     if select_tag:
         return select_tag, url
 
-    # Fallback: Look inside frame tags if we are dealing with an old frameset container
     for frame in soup.find_all(["frame", "iframe"]):
         src = frame.get("src")
         if src:
@@ -72,6 +77,7 @@ def find_dropdown_recursively(session, url, headers, visited=None):
                 return tag, found_url
 
     return None, None
+
 
 def parse_dropdown_from_url(session, url, headers):
     """Fetches a URL and returns a clean text-to-link mapping of its dropdown options."""
@@ -92,8 +98,9 @@ def parse_dropdown_from_url(session, url, headers):
 
     return options_map, actual_content_url
 
+
 def process_final_data_page(session, page_url, headers):
-    """Processes the final results grid page using Direct Row Lookup."""
+    """Processes the final results grid page, parses angles, and downloads selected file to path."""
     try:
         res = session.get(page_url, headers=headers, timeout=12, verify=False)
         soup = BeautifulSoup(res.text, "html.parser")
@@ -104,12 +111,14 @@ def process_final_data_page(session, page_url, headers):
     data_file_row = None
     direction_row = None
 
-    # Target the file links row directly by finding the element containing '.mat'
-    mat_text_node = soup.find(string=re.compile(r"\.mat|Data files", re.IGNORECASE))
-    if mat_text_node:
-        data_file_row = mat_text_node.find_parent("tr")
+    # Scan rows to find the one containing .mat links
+    for row in soup.find_all("tr"):
+        a_tags = row.find_all("a", href=True)
+        mat_links = [a for a in a_tags if ".mat" in a["href"].lower()]
+        if len(mat_links) > 1:
+            data_file_row = row
+            break
 
-    # Look backwards through sibling rows directly above it to find the wind direction parameters
     if data_file_row:
         current_row = data_file_row.find_previous_sibling("tr")
         while current_row:
@@ -120,10 +129,9 @@ def process_final_data_page(session, page_url, headers):
 
     if not direction_row or not data_file_row:
         print("❌ Error parsing the wind angle matrix grid layout.")
-        print(f"Debug Info - Current URL location: {page_url}")
         return
 
-    # Extract clean integers for angles
+    # Extract available angles
     angles = []
     for td in direction_row.find_all(["td", "th"]):
         text = td.get_text().strip()
@@ -131,39 +139,48 @@ def process_final_data_page(session, page_url, headers):
         if match:
             angles.append(int(match.group(1)))
 
-    # Extract matching absolute links
+    # Collect matching download links
     links = []
     for td in data_file_row.find_all("td"):
         a_tag = td.find("a")
-        if a_tag and "href" in a_tag.attrs:
+        if a_tag and "href" in a_tag.attrs and ".mat" in a_tag["href"].lower():
             links.append(urljoin(page_url, a_tag["href"]))
 
     angle_map = dict(zip(angles, links[:len(angles)]))
     available_angles = sorted(list(angle_map.keys()))
 
     if not available_angles:
-        print("❌ No available wind angles parsed from this grid layout.")
+        print("❌ No available wind angles could be extracted from this model grid layout.")
         return
 
     while True:
         print(f"\n📊 SUCCESS! Reached Final Model Configuration Page.")
         print(f"Available Wind Angles: {available_angles}")
-        angle_choice = input("👉 Enter target Wind Angle to parse & save to DB (or 'b' to go back): ").strip().lower()
+        angle_choice = input("👉 Enter target Wind Angle to download (or 'b' to go back): ").strip().lower()
 
         if angle_choice == 'b':
             return "back"
 
         if not angle_choice.isdigit() or int(angle_choice) not in angle_map:
-            print(f"❌ Invalid choice. Please pick a vector from: {available_angles}")
+            print(f"❌ Invalid choice. Please pick an angle from: {available_angles}")
             continue
 
         target_angle = int(angle_choice)
         download_url = angle_map[target_angle]
-        filename = f"tpu_scraped_angle_{target_angle}.mat"
-        local_path = os.path.join("downloads", filename)
+        
+        # Pull original file designation directly from server link (e.g., '000.mat')
+        original_file_name = download_url.split('/')[-1]
+        
+        # Fallback renaming format if the file name parsing returns empty
+        if not original_file_name.endswith('.mat'):
+            original_file_name = f"tpu_angle_{target_angle}.mat"
 
-        os.makedirs("downloads", exist_ok=True)
-        print("📥 Downloading binary wind tunnel dataset...")
+        local_path = os.path.join(DROP_PATH, original_file_name)
+
+        # Ensure directory folder architecture exists locally
+        os.makedirs(DROP_PATH, exist_ok=True)
+        
+        print(f"📥 Downloading dataset file directly to path...")
         try:
             with session.get(download_url, stream=True, timeout=30, verify=False) as r:
                 r.raise_for_status()
@@ -171,18 +188,17 @@ def process_final_data_page(session, page_url, headers):
                     for chunk in r.iter_content(chunk_size=8192):
                         f.write(chunk)
             
-            print("⚡ Pipeline Connected! Ingesting values into local SQLite database...")
-            populate_database_from_mat(local_path)
-            print("🎉 Database successfully updated with calculations!")
+            print(f"🎉 Success! File dropped cleanly into target folder:")
+            print(f"   📂 Path: {local_path}")
         except Exception as e:
-            print(f"❌ Processing failure: {e}")
+            print(f"❌ Processing failure during streaming download: {e}")
+
 
 def run_pipeline_wizard():
-    print("=== TPU Complete Automated Lifecycle Ingestion Engine ===")
+    print("=== TPU Automated File Drop Downloader ===")
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     session = create_legacy_session()
 
-    # 🎯 NEW: Interactive Entry Portal Selection Menu
     print("\n🌐 SELECT A WIND TUNNEL DATABASE CATEGORY PORTAL:")
     portals_list = list(PORTAL_CATALOG.keys())
     for idx, category in enumerate(portals_list, 1):
@@ -204,7 +220,6 @@ def run_pipeline_wizard():
                     break
         print("❌ Invalid entry configuration. Please select a valid category option.")
 
-    # Initialize navigation stacks based on user choices
     url_history = [base_start_url]
     menu_names_history = [selected_category]
 
@@ -212,10 +227,8 @@ def run_pipeline_wizard():
         current_url = url_history[-1]
         print(f"\n🔍 Analyzing layout context layer: {menu_names_history[-1]}")
         
-        # Step 1: Query dropdown matrices from the active URL layer position
         menu_options, resolved_url = parse_dropdown_from_url(session, current_url, headers)
 
-        # Step 2: If no matching options remain, execute final data extractor block
         if not menu_options:
             action = process_final_data_page(session, resolved_url or current_url, headers)
             if action == "back":
@@ -224,7 +237,6 @@ def run_pipeline_wizard():
                 continue
             break
 
-        # Step 3: Present configuration selections to user
         options_list = list(menu_options.keys())
         print(f"📋 CHOOSE FROM THE EXTRACTED OPTIONS:")
         for idx, text in enumerate(options_list, 1):
@@ -248,6 +260,7 @@ def run_pipeline_wizard():
             menu_names_history.append(selected_text)
         else:
             print(f"❌ Out of scope index selection. Enter numbers 1 to {len(options_list)}.")
+
 
 if __name__ == "__main__":
     import urllib3
