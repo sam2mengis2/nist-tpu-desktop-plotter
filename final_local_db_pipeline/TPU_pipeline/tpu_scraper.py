@@ -10,9 +10,14 @@ from urllib3.poolmanager import PoolManager
 # Import your database function from your existing script
 from TPU_parser import populate_database_from_mat
 
-# Root URL container where the chain begins
-BASE_URL = "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/highrise/Homepage/homepageHDF.htm"
+# Catalog of primary TPU database landing portals based on your directory map
+PORTAL_CATALOG = {
+    "High-Rise Buildings (Isolated Building)": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/highrise/Homepage/homepageHDF.htm",
+    "Low-Rise Buildings (Isolated Building)": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/lowrise/mainpage.html",
+    "Low-Rise Buildings with Eaves": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/lowriseeave/mainpage.html",
+    "Low-Rise Buildings (Non-Isolated)": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/grouplowrise/mainpage.html"
 
+}
 
 class LegacySSLAdapter(HTTPAdapter):
     """Bypasses weak Diffie-Hellman handshakes on legacy academic servers."""
@@ -25,7 +30,6 @@ class LegacySSLAdapter(HTTPAdapter):
             num_pools=connections, maxsize=maxsize, block=block, ssl_context=ctx, **pool_kwargs
         )
 
-
 def create_legacy_session():
     """Returns a requests session configured for older server architectures."""
     session = requests.Session()
@@ -33,7 +37,6 @@ def create_legacy_session():
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
-
 
 def find_dropdown_recursively(session, url, headers, visited=None):
     """Scans the current URL and nested framesets to locate either 'mysel' or 'urlsel' dropdowns."""
@@ -70,7 +73,6 @@ def find_dropdown_recursively(session, url, headers, visited=None):
 
     return None, None
 
-
 def parse_dropdown_from_url(session, url, headers):
     """Fetches a URL and returns a clean text-to-link mapping of its dropdown options."""
     select_tag, actual_content_url = find_dropdown_recursively(session, url, headers)
@@ -90,7 +92,6 @@ def parse_dropdown_from_url(session, url, headers):
 
     return options_map, actual_content_url
 
-
 def process_final_data_page(session, page_url, headers):
     """Processes the final results grid page using Direct Row Lookup."""
     try:
@@ -100,16 +101,15 @@ def process_final_data_page(session, page_url, headers):
         print(f"❌ Failed to parse data page: {e}")
         return
 
-    # 🎯 FIX: Direct Row Lookup Strategy
     data_file_row = None
     direction_row = None
 
-    # 1. Target the file links row directly by finding the element containing '.mat'
+    # Target the file links row directly by finding the element containing '.mat'
     mat_text_node = soup.find(string=re.compile(r"\.mat|Data files", re.IGNORECASE))
     if mat_text_node:
         data_file_row = mat_text_node.find_parent("tr")
 
-    # 2. Look backwards through sibling rows directly above it to find the header values
+    # Look backwards through sibling rows directly above it to find the wind direction parameters
     if data_file_row:
         current_row = data_file_row.find_previous_sibling("tr")
         while current_row:
@@ -131,7 +131,7 @@ def process_final_data_page(session, page_url, headers):
         if match:
             angles.append(int(match.group(1)))
 
-    # Extract down matching absolute links
+    # Extract matching absolute links
     links = []
     for td in data_file_row.find_all("td"):
         a_tag = td.find("a")
@@ -177,23 +177,45 @@ def process_final_data_page(session, page_url, headers):
         except Exception as e:
             print(f"❌ Processing failure: {e}")
 
-
 def run_pipeline_wizard():
     print("=== TPU Complete Automated Lifecycle Ingestion Engine ===")
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     session = create_legacy_session()
 
-    url_history = [BASE_URL]
-    menu_names_history = ["Main Directory Container"]
+    # 🎯 NEW: Interactive Entry Portal Selection Menu
+    print("\n🌐 SELECT A WIND TUNNEL DATABASE CATEGORY PORTAL:")
+    portals_list = list(PORTAL_CATALOG.keys())
+    for idx, category in enumerate(portals_list, 1):
+        print(f" [{idx}] {category}")
+    print(f" [{len(portals_list) + 1}] Custom Entry URL (Paste manually)")
+
+    while True:
+        portal_choice = input(f"\n🎯 Enter category number selection (1-{len(portals_list)+1}): ").strip()
+        if portal_choice.isdigit():
+            choice_idx = int(portal_choice)
+            if 1 <= choice_idx <= len(portals_list):
+                selected_category = portals_list[choice_idx - 1]
+                base_start_url = PORTAL_CATALOG[selected_category]
+                break
+            elif choice_idx == len(portals_list) + 1:
+                base_start_url = input("🔗 Paste your custom target TPU portal URL: ").strip()
+                if base_start_url:
+                    selected_category = "Custom Configuration Link"
+                    break
+        print("❌ Invalid entry configuration. Please select a valid category option.")
+
+    # Initialize navigation stacks based on user choices
+    url_history = [base_start_url]
+    menu_names_history = [selected_category]
 
     while True:
         current_url = url_history[-1]
         print(f"\n🔍 Analyzing layout context layer: {menu_names_history[-1]}")
         
-        # Step 1: Look for any available dropdown options at the current URL stage
+        # Step 1: Query dropdown matrices from the active URL layer position
         menu_options, resolved_url = parse_dropdown_from_url(session, current_url, headers)
 
-        # Step 2: If no dropdown menu is found, the selection chain is complete!
+        # Step 2: If no matching options remain, execute final data extractor block
         if not menu_options:
             action = process_final_data_page(session, resolved_url or current_url, headers)
             if action == "back":
@@ -202,7 +224,7 @@ def run_pipeline_wizard():
                 continue
             break
 
-        # Step 3: Present dropdown choices to user
+        # Step 3: Present configuration selections to user
         options_list = list(menu_options.keys())
         print(f"📋 CHOOSE FROM THE EXTRACTED OPTIONS:")
         for idx, text in enumerate(options_list, 1):
@@ -226,7 +248,6 @@ def run_pipeline_wizard():
             menu_names_history.append(selected_text)
         else:
             print(f"❌ Out of scope index selection. Enter numbers 1 to {len(options_list)}.")
-
 
 if __name__ == "__main__":
     import urllib3
