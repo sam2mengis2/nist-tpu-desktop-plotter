@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-tpu_scraper.py - Automated Multi-Category File-Drop Engine
-Crawls the TPU wind tunnel database and downloads target .mat files directly to a file drop folder.
+tpu_scraper.py - Automated Lifecycle Ingestion & Self-Cleaning Engine
+Crawls the TPU database, streams target datasets, processes them into SQLite, 
+and automatically deletes the downloaded files to keep your drive clear.
 """
 
 import os
@@ -13,14 +14,18 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
 
-# 🎯 TARGET FILE DROP PATH (Raw string used to safely handle Windows backslashes)
-DROP_PATH = r"C:\FINAL_SUMMER_PROJ\final_local_db_pipeline\file_drop"
+# 🎯 FIX: Import BOTH the initialization function and the data parser function
+from TPU_parser import populate_database_from_mat, initialize_local_database
+
+# Temporary landing folder for files before processing
+TEMP_DROP_PATH = r"C:\FINAL_SUMMER_PROJ\final_local_db_pipeline\file_drop"
 
 # Catalog of primary TPU database landing portals
 PORTAL_CATALOG = {
     "High-Rise Buildings (Isolated Building)": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/highrise/Homepage/homepageHDF.htm",
     "Low-Rise Buildings (Isolated Building)": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/lowrise/Homepage/homepageLDF.htm",
     "Low-Rise Buildings with Eaves": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/eaves/Homepage/homepageEDF.htm",
+    "Low Rise Buildings (Non-Isolated)": 'https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/grouplowrise/mainpage.html'
 }
 
 
@@ -100,7 +105,7 @@ def parse_dropdown_from_url(session, url, headers):
 
 
 def process_final_data_page(session, page_url, headers):
-    """Processes the final results grid page, parses angles, and downloads selected file to path."""
+    """Processes the final results page, parses files, populates DB, and cleans up the storage."""
     try:
         res = session.get(page_url, headers=headers, timeout=12, verify=False)
         soup = BeautifulSoup(res.text, "html.parser")
@@ -111,7 +116,7 @@ def process_final_data_page(session, page_url, headers):
     data_file_row = None
     direction_row = None
 
-    # Scan rows to find the one containing .mat links
+    # Scan rows to isolate the true time-series data link block
     for row in soup.find_all("tr"):
         a_tags = row.find_all("a", href=True)
         mat_links = [a for a in a_tags if ".mat" in a["href"].lower()]
@@ -139,7 +144,7 @@ def process_final_data_page(session, page_url, headers):
         if match:
             angles.append(int(match.group(1)))
 
-    # Collect matching download links
+    # Collect matching download URLs
     links = []
     for td in data_file_row.find_all("td"):
         a_tag = td.find("a")
@@ -156,7 +161,7 @@ def process_final_data_page(session, page_url, headers):
     while True:
         print(f"\n📊 SUCCESS! Reached Final Model Configuration Page.")
         print(f"Available Wind Angles: {available_angles}")
-        angle_choice = input("👉 Enter target Wind Angle to download (or 'b' to go back): ").strip().lower()
+        angle_choice = input("👉 Enter target Wind Angle to process into DB (or 'b' to go back): ").strip().lower()
 
         if angle_choice == 'b':
             return "back"
@@ -168,19 +173,14 @@ def process_final_data_page(session, page_url, headers):
         target_angle = int(angle_choice)
         download_url = angle_map[target_angle]
         
-        # Pull original file designation directly from server link (e.g., '000.mat')
         original_file_name = download_url.split('/')[-1]
-        
-        # Fallback renaming format if the file name parsing returns empty
         if not original_file_name.endswith('.mat'):
             original_file_name = f"tpu_angle_{target_angle}.mat"
 
-        local_path = os.path.join(DROP_PATH, original_file_name)
-
-        # Ensure directory folder architecture exists locally
-        os.makedirs(DROP_PATH, exist_ok=True)
+        local_path = os.path.join(TEMP_DROP_PATH, original_file_name)
+        os.makedirs(TEMP_DROP_PATH, exist_ok=True)
         
-        print(f"📥 Downloading dataset file directly to path...")
+        print(f"📥 Downloading transient dataset file...")
         try:
             with session.get(download_url, stream=True, timeout=30, verify=False) as r:
                 r.raise_for_status()
@@ -188,14 +188,31 @@ def process_final_data_page(session, page_url, headers):
                     for chunk in r.iter_content(chunk_size=8192):
                         f.write(chunk)
             
-            print(f"🎉 Success! File dropped cleanly into target folder:")
-            print(f"   📂 Path: {local_path}")
+            # Step 2: Handoff file directly to database ingestion function
+            print("⚡ Pipeline Connected! Calculating statistical metrics and updating local database...")
+            populate_database_from_mat(local_path)
+            print("🎉 Database successfully updated with calculations!")
+
         except Exception as e:
-            print(f"❌ Processing failure during streaming download: {e}")
+            print(f"❌ Processing failure during pipeline stream: {e}")
+            
+        finally:
+            # Step 3: Self-Cleaning Action Execution Block
+            if os.path.exists(local_path):
+                try:
+                    print(f"🧹 Cleaning up: Deleting temporary file '{original_file_name}' from drive...")
+                    os.remove(local_path)
+                    print("✨ Temporary file successfully wiped clean.")
+                except Exception as cleanup_err:
+                    print(f"⚠️ Warning: Could not delete temporary file from disk: {cleanup_err}")
 
 
 def run_pipeline_wizard():
-    print("=== TPU Automated File Drop Downloader ===")
+    print("=== TPU Complete Automated Self-Cleaning Ingestion Engine ===")
+    
+    # 🎯 FIX: Automatically check/initialize the database tables on startup
+    initialize_local_database()
+    
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     session = create_legacy_session()
 
