@@ -30,8 +30,8 @@ from TPU_parser import (
 
 PORTAL_CATALOG = {
     "High-Rise Buildings (Isolated Building)": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/highrise/Homepage/homepageHDF.htm",
-    "Low-Rise Buildings (Isolated Building)": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/lowrise/Homepage/homepageLDF.htm",
-    "Low-Rise Buildings with Eaves": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/eaves/Homepage/homepageEDF.htm",
+    "Low-Rise Buildings (Isolated Building)": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/lowrise/mainpage.html",
+    "Low-Rise Buildings with Eaves": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/lowriseeave/mainpage.html",
     "Low-Rise Buildings (Non-Isolated)": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/grouplowrise/mainpage.html"
 }
 

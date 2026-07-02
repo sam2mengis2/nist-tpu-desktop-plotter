@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 app_gui.py - PyQt6 Unified Desktop Workbench for Wind Engineering Analysis
-Tailored explicitly for the TPU_pipeline directory environment.
+Configured with ultra-robust multi-portal layout fallbacks for all TPU categories.
 """
 
 import sys
@@ -26,17 +26,104 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 
-# 🎯 Fixed Imports: Pulling directly from your actual TPU_parser.py file
+# Pulling directly from your local parser configuration script
 from TPU_parser import (
     populate_database_from_mat, 
     initialize_local_database, 
     clear_session_data, 
     DB_PATH
 )
-from tpu_scraper import create_legacy_session, find_dropdown_recursively
+from tpu_scraper import create_legacy_session
 
-# Explicit absolute path to your root file drop folder
+# Absolute path targeting your main workspace directory file landing pad
 DROP_FOLDER = r"C:\FINAL_SUMMER_PROJ\final_local_db_pipeline\file_drop"
+
+
+def analyze_page_architecture(session, url, headers, visited=None):
+    """
+    🎯 Hybrid Navigation Scanner: Identifies final data tables,
+    dropdown menus, or link grids to navigate configurations.
+    """
+    if visited is None:
+        visited = set()
+    if url in visited:
+        return {}, url, False
+    visited.add(url)
+    
+    try:
+        response = session.get(url, headers=headers, timeout=12, verify=False)
+        response.raise_for_status()
+        html_text = response.text
+    except Exception:
+        return {}, url, False
+
+    soup = BeautifulSoup(html_text, "html.parser")
+    
+    # 🎯 FIX: Resilient Leaf Node Verification Layer
+    # Looks for a cluster of data links combined with global wind keywords anywhere on the page text
+    a_tags = soup.find_all("a", href=True)
+    mat_links = [a for a in a_tags if ".mat" in a["href"].lower()]
+    
+    page_text_lower = soup.get_text().lower()
+    has_wind_keywords = "wind" in page_text_lower or "direction" in page_text_lower or "angle" in page_text_lower
+    
+    if len(mat_links) > 3 and has_wind_keywords:
+        return {}, url, True
+
+    # Check sub-frames recursively
+    frames = soup.find_all(["frame", "iframe"])
+    if frames:
+        combined_options = {}
+        for frame in frames:
+            src = frame.get("src")
+            if src:
+                sub_url = urljoin(url, src)
+                opts, final_url, is_final = analyze_page_architecture(session, sub_url, headers, visited)
+                if is_final:
+                    return {}, final_url, True
+                if opts:
+                    combined_options.update(opts)
+        if combined_options:
+            return combined_options, url, False
+
+    # Look for standard dropdown selectors
+    select_tag = (
+        soup.find("select", attrs={"name": "mysel"}) or 
+        soup.find("select", attrs={"name": "urlsel"}) or 
+        soup.find("select", attrs={"name": "building"}) or
+        soup.find("select")
+    )
+    if select_tag:
+        options_map = {}
+        for option in select_tag.find_all("option"):
+            val = option.get("value")
+            text = option.get_text().strip()
+            if val == "def" or not val or "please select" in text.lower():
+                continue
+            options_map[text] = urljoin(url, val)
+        if options_map:
+            return options_map, url, False
+
+    # Fallback text links
+    options_map = {}
+    for a in a_tags:
+        href = a["href"]
+        text = a.get_text().strip()
+        
+        if not href or href.startswith("#") or "javascript:" in href.lower():
+            continue
+        if "http" in href.lower() and not href.startswith(url):
+            continue
+            
+        clean_href = href.split('?')[0].split('#')[0].lower()
+        if clean_href.endswith(('.htm', '.html', '/')) or not '.' in clean_href:
+            if text and len(text) > 1 and not text.lower() in ['back', 'home', 'top', 'return']:
+                options_map[text] = urljoin(url, href)
+                
+    if options_map:
+        return options_map, url, False
+
+    return {}, url, False
 
 
 class MplCanvas(FigureCanvas):
@@ -53,7 +140,6 @@ class TPUDesktopWorkbench(QMainWindow):
         self.setWindowTitle("TPU Wind Tunnel Data Engineering Workbench")
         self.setMinimumSize(1200, 750)
         
-        # Core Session State Tracking Variables
         self.session = create_legacy_session()
         self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         self.current_url = ""
@@ -62,38 +148,29 @@ class TPUDesktopWorkbench(QMainWindow):
         self.active_model_id = None
         self.active_wind_angle = None
         
-        # Portal routes matching legacy database schemas
         self.portals = {
             "High-Rise Buildings (Isolated Building)": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/highrise/Homepage/homepageHDF.htm",
-            "Low-Rise Buildings (Isolated Building)": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/lowrise/Homepage/homepageLDF.htm",
-            "Low-Rise Buildings with Eaves": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/eaves/Homepage/homepageEDF.htm",
-            "Low-Rise Buildings (Non-Isolated)": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/lowrise2/Homepage/homepageLDF2.htm",
+            "Low-Rise Buildings (Isolated Building)": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/lowrise/mainpage.html",
+            "Low-Rise Buildings with Eaves": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/lowriseeave/mainpage.html",
+            "Low-Rise Buildings (Non-Isolated)": "https://www.wind.arch.t-kougei.ac.jp/info_center/windpressure/grouplowrise/mainpage.html",
         }
 
-        # Auto-initialize database storage layer tables on workbench launch
         initialize_local_database()
-        
         self.init_ui_layout()
-        self.log_message("🚀 Workbench initialized. Ready to map target portal configuration topologies.")
+        self.log_message("🚀 Workbench initialized. Ready to map portal layouts.")
 
     def init_ui_layout(self):
-        """Constructs a responsive, scannable split-pane interface structure."""
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         outer_layout = QHBoxLayout(main_widget)
         
-        # Use a splitter layout container so users can dynamically resize the data window grids
         splitter = QSplitter(Qt.Orientation.Horizontal)
         outer_layout.addWidget(splitter)
 
-        # ==========================================
-        # LEFT CONTROL PANEL: Ingestion Controls
-        # ==========================================
         left_panel = QFrame()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(5, 5, 5, 5)
         
-        # Group 1: Portal Navigation Wizard Controls
         ingest_group = QGroupBox("Crawler Configuration Layer")
         ingest_layout = QVBoxLayout(ingest_group)
         
@@ -131,7 +208,6 @@ class TPUDesktopWorkbench(QMainWindow):
         
         left_layout.addWidget(ingest_group)
 
-        # Group 2: Output Operations Control Panel
         dashboard_group = QGroupBox("Live Session Dashboard Capabilities")
         dashboard_layout = QVBoxLayout(dashboard_group)
         
@@ -153,7 +229,6 @@ class TPUDesktopWorkbench(QMainWindow):
         
         left_layout.addWidget(dashboard_group)
 
-        # Group 3: Console Output Logging Box
         log_group = QGroupBox("System Activity Diagnostics Console")
         log_layout = QVBoxLayout(log_group)
         self.console_out = QTextEdit()
@@ -164,9 +239,6 @@ class TPUDesktopWorkbench(QMainWindow):
         left_layout.addWidget(log_group)
         splitter.addWidget(left_panel)
 
-        # ==========================================
-        # RIGHT PANEL: Embedded Surface Plots Canvas
-        # ==========================================
         right_panel = QFrame()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(5, 5, 5, 5)
@@ -174,7 +246,6 @@ class TPUDesktopWorkbench(QMainWindow):
         plot_group = QGroupBox("Integrated Visualization Display Array")
         plot_box_layout = QVBoxLayout(plot_group)
         
-        # Attach the Matplotlib UI widgets natively inside our frame layout
         self.canvas = MplCanvas(self, width=6, height=5, dpi=100)
         self.toolbar = NavigationToolbar(self.canvas, self)
         
@@ -183,61 +254,51 @@ class TPUDesktopWorkbench(QMainWindow):
         right_layout.addWidget(plot_group)
         
         splitter.addWidget(right_panel)
-        
-        # Standardize left-to-right spacing weights
         splitter.setSizes([450, 750])
 
-    # ==========================================
-    # WORKBENCH INTERACTIVE FUNCTION ROUTINES
-    # ==========================================
     def log_message(self, message):
         self.console_out.append(message)
         
     def handle_portal_connection(self):
         selected_key = self.portal_combo.currentText()
         self.current_url = self.portals[selected_key]
-        self.log_message(f"\n🌐 Contacting Portal Gateway Matrix: {selected_key}...")
+        self.log_message(f"\n🌐 Mapping Portal Structure: {selected_key}...")
         self.populate_dropdown_combobox()
 
     def populate_dropdown_combobox(self):
-        """Scans current nested layout structure contexts and translates fields to UI elements."""
         self.options_combo.clear()
         self.btn_next_level.setEnabled(False)
         
-        select_tag, actual_url = find_dropdown_recursively(self.session, self.current_url, self.headers)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        options_map, resolved_url, is_final_page = analyze_page_architecture(self.session, self.current_url, self.headers)
+        QApplication.restoreOverrideCursor()
         
-        if not select_tag:
-            self.log_message("📊 Status: Grid leaf node reached. Final matrix table uncovered.")
-            self.resolved_page_url = actual_url or self.current_url
+        self.resolved_page_url = resolved_url
+        
+        if is_final_page:
+            self.log_message("📊 Status: Leaf data page reached successfully. Opening wind directions grid...")
             self.parse_final_angles_grid()
             return
 
-        self.resolved_page_url = actual_url
-        options_found = False
-        for option in select_tag.find_all("option"):
-            val = option.get("value")
-            text = option.get_text().strip()
-            if val == "def" or not val or "please select" in text.lower():
-                continue
-            self.options_combo.addItem(text, urljoin(self.resolved_page_url, val))
-            options_found = True
-
-        if options_found:
-            self.log_message(f"📋 Loaded {self.options_combo.count()} sub-configuration categories into selection matrix.")
-            self.btn_next_level.setEnabled(False if self.options_combo.count() == 0 else True)
+        if options_map:
+            self.log_message(f"📋 Loaded {len(options_map)} options into the selection layout step.")
+            for text, target_link in sorted(options_map.items()):
+                self.options_combo.addItem(text, target_link)
+            self.btn_next_level.setEnabled(True)
+        else:
+            self.log_message("⚠️ Warning: No navigation elements found on this layer link.")
 
     def handle_drill_down(self):
-        """Advances down another level of the network frame structure."""
         selected_text = self.options_combo.currentText()
         next_target_url = self.options_combo.currentData()
         
         if next_target_url:
-            self.log_message(f"🔍 Advancing downstream layer: '{selected_text}'")
+            self.log_message(f"🔍 Advancing to next configuration layer: '{selected_text}'")
             self.current_url = next_target_url
             self.populate_dropdown_combobox()
 
     def parse_final_angles_grid(self):
-        """Parses the data rows to locate wind angle matrix coordinates and links."""
+        """Extracts wind orientation metrics and file mapping keys using a robust case-insensitive parser."""
         self.angle_combo.clear()
         self.btn_ingest.setEnabled(False)
         self.angle_links_map = {}
@@ -259,7 +320,9 @@ class TPUDesktopWorkbench(QMainWindow):
         if data_file_row:
             cur = data_file_row.find_previous_sibling("tr")
             while cur:
-                if "Wind direction" in cur.get_text():
+                cur_text_lower = cur.get_text().lower()
+                # 🎯 FIX: Case-insensitive label verification loop
+                if "wind direction" in cur_text_lower or "direction" in cur_text_lower or "angle" in cur_text_lower:
                     direction_row = cur
                     break
                 cur = cur.find_previous_sibling("tr")
@@ -281,11 +344,10 @@ class TPUDesktopWorkbench(QMainWindow):
             self.angle_combo.addItem(f"Wind Angle: {angle}°", angle)
             
         if self.angle_links_map:
-            self.log_message(f"🎯 Success! Discovered {len(self.angle_links_map)} evaluation wind coordinate datasets.")
+            self.log_message(f"🎯 Success! Located {len(self.angle_links_map)} available wind direction options.")
             self.btn_ingest.setEnabled(True)
 
     def handle_dataset_ingestion(self):
-        """Streams the target binary matrix, extracts characteristics, and activates capabilities."""
         self.btn_export_all_time.setEnabled(False)
         self.btn_export_summary.setEnabled(False)
         self.btn_plot_contour.setEnabled(False)
@@ -300,7 +362,7 @@ class TPUDesktopWorkbench(QMainWindow):
         local_path = os.path.join(DROP_FOLDER, file_name)
         os.makedirs(DROP_FOLDER, exist_ok=True)
         
-        self.log_message(f"\n📥 Running download streaming pipe for angle {target_angle}°...")
+        self.log_message(f"\n📥 Streaming dataset for wind angle {target_angle}°...")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         
         try:
@@ -310,13 +372,13 @@ class TPUDesktopWorkbench(QMainWindow):
                     for chunk in r.iter_content(chunk_size=8192):
                         f.write(chunk)
                         
-            self.log_message("⚡ Processing data into SQL database matrix...")
+            self.log_message("⚡ Ingesting data matrices into SQL container layout...")
             model_id, wind_angle = populate_database_from_mat(local_path)
             
             if model_id is not None:
                 self.active_model_id = model_id
                 self.active_wind_angle = wind_angle
-                self.log_message("🎉 Ingestion complete! Transient cache database locked and loaded.")
+                self.log_message("🎉 Load Complete! Session cache database is active.")
                 
                 self.btn_export_all_time.setEnabled(True)
                 self.btn_export_summary.setEnabled(True)
@@ -333,11 +395,10 @@ class TPUDesktopWorkbench(QMainWindow):
                     pass
 
     def export_full_time_series_csv(self):
-        """Unpacks SQL binary blobs and compiles full time-series matrices to CSV directly from UI."""
         if not self.active_model_id:
             return
             
-        self.log_message("⏳ Unpacking compressed binary array timelines from database cache...")
+        self.log_message("⏳ Generating matrix export spreadsheet... This may take a moment.")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         
         try:
@@ -354,7 +415,7 @@ class TPUDesktopWorkbench(QMainWindow):
             conn.close()
             
             if not rows:
-                self.log_message("❌ Extraction failed: No transient data located inside cache.")
+                self.log_message("❌ Extraction failed: Data missing from cache.")
                 return
 
             csv_data = {}
@@ -375,14 +436,13 @@ class TPUDesktopWorkbench(QMainWindow):
                     vals = [str(step)] + [str(arr[step]) if step < len(arr) else "" for arr in arrays]
                     f.write(",".join(vals) + "\n")
                     
-            self.log_message(f"🎉 Success! Full Time-Series CSV written to:\n📁 {out_csv}")
+            self.log_message(f"🎉 Success! Full Matrix CSV generated:\n📁 {out_csv}")
         except Exception as e:
-            self.log_message(f"❌ CSV Matrix Compilation Error: {e}")
+            self.log_message(f"❌ CSV Compilation Error: {e}")
         finally:
             QApplication.restoreOverrideCursor()
 
     def export_spatial_summary_csv(self):
-        """Exports calculated statistics alongside their raw MATLAB face indices."""
         if not self.active_model_id:
             return
             
@@ -404,12 +464,11 @@ class TPUDesktopWorkbench(QMainWindow):
                 for r in rows:
                     f.write(f"{r[0]},{r[1]},{r[2]},{r[3] if r[3] is not None else ''}\n")
                     
-            self.log_message(f"🎉 Success! Spatial Geometry statistics sheet generated:\n📁 {out_csv}")
+            self.log_message(f"🎉 Success! Spatial statistics CSV written:\n📁 {out_csv}")
         except Exception as e:
             self.log_message(f"❌ Statistical mapping compilation failure: {e}")
 
     def render_spatial_contour_map(self):
-        """Queries statistical vectors and updates the embedded Matplotlib element on the UI layout canvas."""
         if not self.active_model_id:
             return
             
@@ -421,7 +480,7 @@ class TPUDesktopWorkbench(QMainWindow):
             conn.close()
             
             if not means:
-                self.log_message("❌ Visualization fault: No records found to map coordinates.")
+                self.log_message("❌ Visualization fault: No records found to map.")
                 return
 
             self.canvas.axes.cla()
@@ -447,7 +506,7 @@ class TPUDesktopWorkbench(QMainWindow):
             self.colorbar = self.canvas.figure.colorbar(contour, ax=self.canvas.axes, label="Mean Pressure Coefficient ($C_p$)")
             
             self.canvas.draw_idle()
-            self.log_message("🎨 Visualization canvas re-rendered successfully.")
+            self.log_message("🎨 UI Visualization frame re-rendered.")
             
         except Exception as e:
             self.log_message(f"❌ Contour Renderer Error: {e}")
@@ -466,7 +525,6 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     
-    # Apply a modern dark theme layout
     palette = app.palette()
     from PyQt6.QtGui import QPalette, QColor
     palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
