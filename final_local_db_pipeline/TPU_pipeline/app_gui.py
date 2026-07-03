@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 app_gui.py - PyQt6 Unified Desktop Workbench for Wind Engineering Analysis
-Configured with ultra-robust multi-portal layout fallbacks for all TPU categories.
+Equipped with absolute spatial mesh rendering, dynamic face discovery, and custom user export paths.
 """
 
 import sys
@@ -15,33 +15,31 @@ from bs4 import BeautifulSoup
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-    QLabel, QComboBox, QPushButton, QTextEdit, QGroupBox, QSplitter, QFrame
+    QLabel, QComboBox, QPushButton, QTextEdit, QGroupBox, QSplitter, QFrame,
+    QFileDialog  # 🎯 Added native file system picker framework
 )
 from PyQt6.QtCore import Qt
 
-# Embed Matplotlib natively inside Qt layouts
 import matplotlib
 matplotlib.use("QtAgg")
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 
-# Pulling directly from your local parser configuration script
+# Link with actual updated TPU_parser.py script
 from TPU_parser import (
     populate_database_from_mat, 
     initialize_local_database, 
     clear_session_data, 
-    DB_PATH
+    DB_PATH,
+    DROP_FOLDER
 )
 from tpu_scraper import create_legacy_session
-
-# Absolute path targeting your main workspace directory file landing pad
-DROP_FOLDER = r"C:\FINAL_SUMMER_PROJ\final_local_db_pipeline\file_drop"
 
 
 def analyze_page_architecture(session, url, headers, visited=None):
     """
-    🎯 Hybrid Navigation Scanner: Identifies final data tables,
+    Hybrid Navigation Scanner: Identifies final data tables,
     dropdown menus, or link grids to navigate configurations.
     """
     if visited is None:
@@ -50,43 +48,17 @@ def analyze_page_architecture(session, url, headers, visited=None):
         return {}, url, False
     visited.add(url)
     
-    try:
-        response = session.get(url, headers=headers, timeout=12, verify=False)
-        response.raise_for_status()
-        html_text = response.text
-    except Exception:
+    url = url.strip()
+    if url.startswith("about:") or "javascript:" in url.lower():
         return {}, url, False
+        
+    response = session.get(url, headers=headers, timeout=12, verify=False)
+    response.raise_for_status()
+    html_text = response.text
 
     soup = BeautifulSoup(html_text, "html.parser")
     
-    # 🎯 FIX: Resilient Leaf Node Verification Layer
-    # Looks for a cluster of data links combined with global wind keywords anywhere on the page text
-    a_tags = soup.find_all("a", href=True)
-    mat_links = [a for a in a_tags if ".mat" in a["href"].lower()]
-    
-    page_text_lower = soup.get_text().lower()
-    has_wind_keywords = "wind" in page_text_lower or "direction" in page_text_lower or "angle" in page_text_lower
-    
-    if len(mat_links) > 3 and has_wind_keywords:
-        return {}, url, True
-
-    # Check sub-frames recursively
-    frames = soup.find_all(["frame", "iframe"])
-    if frames:
-        combined_options = {}
-        for frame in frames:
-            src = frame.get("src")
-            if src:
-                sub_url = urljoin(url, src)
-                opts, final_url, is_final = analyze_page_architecture(session, sub_url, headers, visited)
-                if is_final:
-                    return {}, final_url, True
-                if opts:
-                    combined_options.update(opts)
-        if combined_options:
-            return combined_options, url, False
-
-    # Look for standard dropdown selectors
+    # Priority 1: Inspect the current page context for explicit select dropdown menus
     select_tag = (
         soup.find("select", attrs={"name": "mysel"}) or 
         soup.find("select", attrs={"name": "urlsel"}) or 
@@ -97,6 +69,11 @@ def analyze_page_architecture(session, url, headers, visited=None):
         options_map = {}
         for option in select_tag.find_all("option"):
             val = option.get("value")
+            if val is None:
+                val = option.get_text().strip()
+            else:
+                val = val.strip()
+                
             text = option.get_text().strip()
             if val == "def" or not val or "please select" in text.lower():
                 continue
@@ -104,22 +81,62 @@ def analyze_page_architecture(session, url, headers, visited=None):
         if options_map:
             return options_map, url, False
 
-    # Fallback text links
+    # Priority 2: Check sub-frames recursively but aggregate all options found
+    frames = soup.find_all(["frame", "iframe"])
+    if frames:
+        combined_options = {}
+        potential_final_url = url
+        potential_is_final = False
+        
+        for frame in frames:
+            src = frame.get("src")
+            if src:
+                sub_url = urljoin(url, src.strip())
+                try:
+                    opts, final_url, is_final = analyze_page_architecture(session, sub_url, headers, visited)
+                    if is_final:
+                        potential_final_url = final_url
+                        potential_is_final = True
+                    if opts:
+                        combined_options.update(opts)
+                except Exception:
+                    pass 
+                    
+        if combined_options:
+            return combined_options, url, False
+            
+        if potential_is_final:
+            return {}, potential_final_url, True
+
+    # Priority 3: Check for the true data table row signature
+    is_final_data_page = False
+    for row in soup.find_all("tr"):
+        row_mat_links = [a for a in row.find_all("a", href=True) if ".mat" in a["href"].lower()]
+        if len(row_mat_links) > 1:
+            is_final_data_page = True
+            break
+            
+    if is_final_data_page:
+        return {}, url, True
+
+    # Priority 4: Fallback text links
     options_map = {}
+    a_tags = soup.find_all("a", href=True)
     for a in a_tags:
-        href = a["href"]
+        href = a["href"].strip()
         text = a.get_text().strip()
         
         if not href or href.startswith("#") or "javascript:" in href.lower():
             continue
-        if "http" in href.lower() and not href.startswith(url):
+            
+        if "http" in href.lower() and "arch.t-kougei.ac.jp" not in href.lower():
             continue
             
         clean_href = href.split('?')[0].split('#')[0].lower()
         if clean_href.endswith(('.htm', '.html', '/')) or not '.' in clean_href:
             if text and len(text) > 1 and not text.lower() in ['back', 'home', 'top', 'return']:
                 options_map[text] = urljoin(url, href)
-                
+                    
     if options_map:
         return options_map, url, False
 
@@ -127,7 +144,6 @@ def analyze_page_architecture(session, url, headers, visited=None):
 
 
 class MplCanvas(FigureCanvas):
-    """Integrated graphics rendering canvas component."""
     def __init__(self, parent=None, width=5, height=4, dpi=100):
         fig = Figure(figsize=(width, height), dpi=dpi)
         self.axes = fig.add_subplot(111)
@@ -221,6 +237,19 @@ class TPUDesktopWorkbench(QMainWindow):
         self.btn_export_summary.setEnabled(False)
         dashboard_layout.addWidget(self.btn_export_summary)
         
+        dashboard_layout.addWidget(QFrame(frameShape=QFrame.Shape.HLine))
+        
+        dashboard_layout.addWidget(QLabel("Select Target Metric to Visualize:"))
+        self.metric_combo = QComboBox()
+        self.metric_combo.addItem("Mean Pressure Coefficient (Mean Cp)", "mean_cp")
+        self.metric_combo.addItem("Standard Deviation (Std Dev Cp)", "std_cp")
+        dashboard_layout.addWidget(self.metric_combo)
+        
+        dashboard_layout.addWidget(QLabel("Select Target Face to Visualize:"))
+        self.face_combo = QComboBox()
+        self.face_combo.addItem("All Faces Combined", "all")
+        dashboard_layout.addWidget(self.face_combo)
+        
         self.btn_plot_contour = QPushButton("Render Spatial Surface Contour Plot")
         self.btn_plot_contour.setStyleSheet("font-weight: bold; background-color: #2aa25b; color: white;")
         self.btn_plot_contour.clicked.connect(self.render_spatial_contour_map)
@@ -270,9 +299,18 @@ class TPUDesktopWorkbench(QMainWindow):
         self.btn_next_level.setEnabled(False)
         
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        options_map, resolved_url, is_final_page = analyze_page_architecture(self.session, self.current_url, self.headers)
+        try:
+            options_map, resolved_url, is_final_page = analyze_page_architecture(self.session, self.current_url, self.headers)
+            err_msg = None
+        except Exception as e:
+            options_map, resolved_url, is_final_page = {}, self.current_url, False
+            err_msg = f"❌ Ingestion Crawler Exception: {e}"
         QApplication.restoreOverrideCursor()
         
+        if err_msg:
+            self.log_message(err_msg)
+            return
+            
         self.resolved_page_url = resolved_url
         
         if is_final_page:
@@ -298,7 +336,6 @@ class TPUDesktopWorkbench(QMainWindow):
             self.populate_dropdown_combobox()
 
     def parse_final_angles_grid(self):
-        """Extracts wind orientation metrics and file mapping keys using a robust case-insensitive parser."""
         self.angle_combo.clear()
         self.btn_ingest.setEnabled(False)
         self.angle_links_map = {}
@@ -310,42 +347,75 @@ class TPUDesktopWorkbench(QMainWindow):
             self.log_message(f"❌ Scraping Network Fault: {e}")
             return
 
-        data_file_row, direction_row = None, None
+        data_file_row = None
         for row in soup.find_all("tr"):
-            a_tags = row.find_all("a", href=True)
-            if len([a for a in a_tags if ".mat" in a["href"].lower()]) > 1:
+            row_mat_links = [a for a in row.find_all("a", href=True) if ".mat" in a["href"].lower()]
+            if len(row_mat_links) > 1:
                 data_file_row = row
                 break
 
-        if data_file_row:
-            cur = data_file_row.find_previous_sibling("tr")
-            while cur:
-                cur_text_lower = cur.get_text().lower()
-                # 🎯 FIX: Case-insensitive label verification loop
-                if "wind direction" in cur_text_lower or "direction" in cur_text_lower or "angle" in cur_text_lower:
-                    direction_row = cur
-                    break
-                cur = cur.find_previous_sibling("tr")
+        if not data_file_row:
+            self.log_message("❌ Framework Parse Error: Could not locate binary matrix download array table.")
+            return
 
-        if not direction_row or not data_file_row:
-            self.log_message("❌ Framework Parse Error: Could not resolve wind angle table distribution grids.")
+        def cell_contains_angle(td):
+            if re.search(r"\d+", td.get_text()):
+                return True
+            img = td.find("img")
+            if img and img.get("src") and re.search(r"\d+", os.path.basename(img["src"])):
+                return True
+            return False
+
+        direction_row = None
+        cur = data_file_row.find_previous_sibling("tr")
+        while cur:
+            has_mat = any(".mat" in a["href"].lower() for a in cur.find_all("a", href=True))
+            if not has_mat and len([td for td in cur.find_all(["td", "th"]) if cell_contains_angle(td)]) > 1:
+                direction_row = cur
+                break
+            cur = cur.find_previous_sibling("tr")
+
+        if not direction_row:
+            parent_table = data_file_row.find_parent("table")
+            if parent_table:
+                for row in parent_table.find_all("tr"):
+                    if row is data_file_row:
+                        continue
+                    has_mat = any(".mat" in a["href"].lower() for a in row.find_all("a", href=True))
+                    if not has_mat and len([td for td in row.find_all(["td", "th"]) if cell_contains_angle(td)]) > 1:
+                        direction_row = row
+                        break
+
+        if not direction_row:
+            self.log_message("❌ Framework Parse Error: Could not resolve header wind angle row mapping coordinates.")
             return
 
         angles = []
         for td in direction_row.find_all(["td", "th"]):
-            m = re.search(r"(\d+)", td.get_text().strip())
-            if m:
-                angles.append(int(m.group(1)))
+            text_val = td.get_text().strip()
+            m_text = re.search(r"(\d+)", text_val)
+            if m_text:
+                angles.append(int(m_text.group(1)))
+                continue
+                
+            img_tag = td.find("img")
+            if img_tag and img_tag.get("src"):
+                filename_base = os.path.basename(img_tag["src"])
+                m_img = re.search(r"(\d+)", filename_base)
+                if m_img:
+                    angles.append(int(m_img.group(1)))
+                    continue
 
         links = [urljoin(self.resolved_page_url, td.find("a")["href"]) for td in data_file_row.find_all("td") if td.find("a") and ".mat" in td.find("a")["href"].lower()]
         self.angle_links_map = dict(zip(angles, links[:len(angles)]))
         
-        for angle in sorted(self.angle_links_map.keys()):
-            self.angle_combo.addItem(f"Wind Angle: {angle}°", angle)
-            
         if self.angle_links_map:
+            for angle in sorted(self.angle_links_map.keys()):
+                self.angle_combo.addItem(f"Wind Angle: {angle}°", angle)
             self.log_message(f"🎯 Success! Located {len(self.angle_links_map)} available wind direction options.")
             self.btn_ingest.setEnabled(True)
+        else:
+            self.log_message("❌ Framework Parse Error: Identified file rows but parsed 0 wind direction angles from the table header.")
 
     def handle_dataset_ingestion(self):
         self.btn_export_all_time.setEnabled(False)
@@ -373,16 +443,39 @@ class TPUDesktopWorkbench(QMainWindow):
                         f.write(chunk)
                         
             self.log_message("⚡ Ingesting data matrices into SQL container layout...")
-            model_id, wind_angle = populate_database_from_mat(local_path)
+            QApplication.processEvents()
+            
+            model_id, wind_angle = populate_database_from_mat(local_path, target_angle=target_angle)
             
             if model_id is not None:
                 self.active_model_id = model_id
                 self.active_wind_angle = wind_angle
                 self.log_message("🎉 Load Complete! Session cache database is active.")
                 
+                self.face_combo.clear()
+                self.face_combo.addItem("All Faces Combined", "all")
+                
+                conn = sqlite3.connect(DB_PATH)
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT DISTINCT face 
+                    FROM tap_measurements 
+                    WHERE model_id=? AND wind_angle=? AND face IS NOT NULL 
+                    ORDER BY face
+                """, (self.active_model_id, self.active_wind_angle))
+                discovered_faces = [row[0] for row in cursor.fetchall()]
+                conn.close()
+                
+                for face_num in discovered_faces:
+                    self.face_combo.addItem(f"Face {face_num} Layout", face_num)
+                
+                self.log_message(f"📋 Discovered {len(discovered_faces)} unique surface faces inside matrix architecture.")
+                
                 self.btn_export_all_time.setEnabled(True)
                 self.btn_export_summary.setEnabled(True)
                 self.btn_plot_contour.setEnabled(True)
+            else:
+                self.log_message("❌ Processing Pipeline Ingestion Fault: Parser failed to unbox valid database rows.")
                 
         except Exception as e:
             self.log_message(f"❌ Processing Pipeline Ingestion Fault: {e}")
@@ -395,9 +488,24 @@ class TPUDesktopWorkbench(QMainWindow):
                     pass
 
     def export_full_time_series_csv(self):
+        """🎯 UPGRADE: Let user choose the save location natively and prevent automated wiping."""
         if not self.active_model_id:
             return
             
+        # Spawn native system window to request target save location
+        default_filename = f"tpu_tabular_time_history_angle_{self.active_wind_angle}.csv"
+        out_csv, _ = QFileDialog.getSaveFileName(
+            self, 
+            "Export Full Time-Series Grid", 
+            default_filename, 
+            "CSV Files (*.csv)"
+        )
+        
+        # If user closes or cancels window, exit out gracefully
+        if not out_csv:
+            self.log_message("⚠️ Export cancelled by user.")
+            return
+
         self.log_message("⏳ Generating matrix export spreadsheet... This may take a moment.")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         
@@ -426,8 +534,6 @@ class TPUDesktopWorkbench(QMainWindow):
                 csv_data[f"Tap_{tap_num}_Cp"] = series
                 if len(series) > max_len:
                     max_len = len(series)
-
-            out_csv = os.path.join(DROP_FOLDER, f"tpu_tabular_time_history_angle_{self.active_wind_angle}.csv")
             
             with open(out_csv, "w") as f:
                 f.write(",".join(["TimeStep"] + list(csv_data.keys())) + "\n")
@@ -443,14 +549,28 @@ class TPUDesktopWorkbench(QMainWindow):
             QApplication.restoreOverrideCursor()
 
     def export_spatial_summary_csv(self):
+        """🎯 UPGRADE: Let user choose the save location natively and prevent automated wiping."""
         if not self.active_model_id:
+            return
+            
+        # Spawn native system window to request target save location
+        default_filename = f"tpu_spatial_summary_grid_angle_{self.active_wind_angle}.csv"
+        out_csv, _ = QFileDialog.getSaveFileName(
+            self, 
+            "Export Spatial Metrics & Faces", 
+            default_filename, 
+            "CSV Files (*.csv)"
+        )
+        
+        if not out_csv:
+            self.log_message("⚠️ Export cancelled by user.")
             return
             
         try:
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT tap_number, mean_cp, std_cp, face 
+                SELECT tap_number, mean_cp, std_cp, face, x_coord, y_coord 
                 FROM tap_measurements 
                 WHERE model_id=? AND wind_angle=? 
                 ORDER BY tap_number
@@ -458,11 +578,10 @@ class TPUDesktopWorkbench(QMainWindow):
             rows = cursor.fetchall()
             conn.close()
             
-            out_csv = os.path.join(DROP_FOLDER, f"tpu_spatial_summary_grid_angle_{self.active_wind_angle}.csv")
             with open(out_csv, "w") as f:
-                f.write("Tap_Number,Mean_Cp,Std_Dev_Cp,Raw_Face_Code\n")
+                f.write("Tap_Number,Mean_Cp,Std_Dev_Cp,Raw_Face_Code,X_Coordinate,Y_Coordinate\n")
                 for r in rows:
-                    f.write(f"{r[0]},{r[1]},{r[2]},{r[3] if r[3] is not None else ''}\n")
+                    f.write(f"{r[0]},{r[1]},{r[2]},{r[3] if r[3] is not None else ''},{r[4] if r[4] is not None else ''},{r[5] if r[5] is not None else ''}\n")
                     
             self.log_message(f"🎉 Success! Spatial statistics CSV written:\n📁 {out_csv}")
         except Exception as e:
@@ -472,47 +591,75 @@ class TPUDesktopWorkbench(QMainWindow):
         if not self.active_model_id:
             return
             
+        selected_face = self.face_combo.currentData()
+        selected_metric = self.metric_combo.currentData()
+        metric_label = "Mean Cp" if selected_metric == "mean_cp" else "Std Dev Cp"
+        
         try:
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
-            cursor.execute("SELECT mean_cp FROM tap_measurements WHERE model_id=? AND wind_angle=? ORDER BY tap_number", (self.active_model_id, self.active_wind_angle))
-            means = [r[0] for r in cursor.fetchall()]
+            
+            col_target = "mean_cp" if selected_metric == "mean_cp" else "std_cp"
+            
+            if selected_face == "all":
+                cursor.execute(f"""
+                    SELECT {col_target}, x_coord, y_coord 
+                    FROM tap_measurements 
+                    WHERE model_id=? AND wind_angle=? 
+                    ORDER BY tap_number
+                """, (self.active_model_id, self.active_wind_angle))
+                face_label_str = "All Faces Combined"
+            else:
+                cursor.execute(f"""
+                    SELECT {col_target}, x_coord, y_coord 
+                    FROM tap_measurements 
+                    WHERE model_id=? AND wind_angle=? AND face=?
+                    ORDER BY tap_number
+                """, (self.active_model_id, self.active_wind_angle, selected_face))
+                face_label_str = f"Isolated Face {selected_face}"
+
+            records = cursor.fetchall()
             conn.close()
             
-            if not means:
-                self.log_message("❌ Visualization fault: No records found to map.")
+            if not records:
+                self.log_message(f"❌ Visualization fault: No records found to map for {face_label_str}.")
                 return
 
-            self.canvas.axes.cla()
+            if len(records) < 4:
+                self.log_message(f"⚠️ Warning: Not enough spatial data nodes on {face_label_str} to compute triangulation gradients (minimum 4 nodes required).")
+                return
+
+            values = np.array([r[0] for r in records])
+            x_coords = np.array([r[1] for r in records])
+            y_coords = np.array([r[2] for r in records])
+
+            if None in x_coords or None in y_coords:
+                self.log_message("⚠️ Spatial tracking vectors incomplete. Unable to perform mesh layout rendering.")
+                return
+
+            self.canvas.figure.clear()
+            self.canvas.axes = self.canvas.figure.add_subplot(111)
             
-            total = len(means)
-            cols = int(np.ceil(np.sqrt(total)))
-            rows = int(np.ceil(total / cols))
+            chosen_cmap = 'RdBu_r' if selected_metric == "mean_cp" else 'viridis'
             
-            padded = np.zeros(rows * cols)
-            padded[:total] = means
-            grid_z = padded.reshape((rows, cols))
+            contour = self.canvas.axes.tricontourf(x_coords, y_coords, values, levels=15, cmap=chosen_cmap)
+            self.canvas.axes.scatter(x_coords, y_coords, color='black', edgecolors='white', s=40, linewidths=1.2, alpha=0.9, zorder=3)
             
-            contour = self.canvas.axes.contourf(grid_z, cmap='RdBu_r', levels=15)
-            self.canvas.axes.set_title(f"TPU Grid Coordinate Wind Distribution Mapping (Angle: {self.active_wind_angle}°)")
-            self.canvas.axes.set_xlabel("Horizontal Grid Space Axis (X)")
-            self.canvas.axes.set_ylabel("Vertical Grid Space Axis (Y)")
+            self.canvas.axes.set_title(f"TPU Spatial Grid {metric_label} Map - {face_label_str} (Angle: {self.active_wind_angle}°)")
+            self.canvas.axes.set_xlabel("Absolute Coordinate Tracking Axis (X)")
+            self.canvas.axes.set_ylabel("Absolute Coordinate Tracking Axis (Y)")
             
-            if hasattr(self, 'colorbar'):
-                try:
-                    self.colorbar.remove()
-                except Exception:
-                    pass
-            self.colorbar = self.canvas.figure.colorbar(contour, ax=self.canvas.axes, label="Mean Pressure Coefficient ($C_p$)")
+            cbar_title = "Mean Pressure Coefficient (C_p)" if selected_metric == "mean_cp" else "Standard Deviation (\u03c3)"
+            self.canvas.figure.colorbar(contour, ax=self.canvas.axes, label=cbar_title)
             
-            self.canvas.draw_idle()
-            self.log_message("🎨 UI Visualization frame re-rendered.")
+            self.canvas.figure.tight_layout()
+            self.canvas.draw()
+            self.log_message(f"🎨 UI Visualization frame re-rendered for {metric_label} ({face_label_str}).")
             
         except Exception as e:
             self.log_message(f"❌ Contour Renderer Error: {e}")
 
     def closeEvent(self, event):
-        """Ties database evacuation hooks directly to desktop lifecycle close signals."""
         self.log_message("🧹 Terminating window context... Clearing transient cache...")
         clear_session_data()
         event.accept()
