@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 NIST_pipeline/app_gui.py - Dedicated NIST Aerodynamic User Interface Frame
-Cleanly refactored to consume modular Scraper and Parser backends.
+Cleanly refactored with a global QThreadPool to prevent application freezing loops.
 """
 
 import sys
@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QLabel, QComboBox, QPushButton, QTextEdit, QGroupBox, QSplitter, QFrame,
     QFileDialog
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QRunnable, QObject, pyqtSignal, QThreadPool
 
 import matplotlib
 matplotlib.use("QtAgg")
@@ -23,15 +23,49 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 
+# Modular Sibling Inclusions
 from NIST_scraper import analyze_nist_architecture, get_cached_links_for_leaf
 from NIST_parser import (
-    populate_database_from_archive, # 🎯 Linked with updated lazy entry target
+    populate_database_from_archive, 
     scan_archive_pure_memory, 
     initialize_local_database, 
     clear_session_data, 
     DB_PATH,
     DROP_FOLDER
 )
+
+
+class WorkerSignals(QObject):
+    """Defines communication channels between the background thread and the UI."""
+    progress_signal = pyqtSignal(str)
+    success_signal = pyqtSignal(dict)
+    failure_signal = pyqtSignal(str)
+
+
+class ArchiveScannerRunnable(QRunnable):
+    """🎯 BACKGROUND WORKER: Executes file streaming and memory scanning tasks on a separate thread pool."""
+    def __init__(self, session, download_url, save_path):
+        super().__init__()
+        self.session = session
+        self.download_url = download_url
+        self.save_path = save_path
+        self.signals = WorkerSignals()
+
+    def run(self):
+        try:
+            self.signals.progress_signal.emit("📥 Streaming master package archive directly from server...")
+            with self.session.get(self.download_url, stream=True, timeout=45, verify=False) as r:
+                r.raise_for_status()
+                with open(self.save_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=16384):
+                        f.write(chunk)
+            
+            self.signals.progress_signal.emit("⚡ Running in-memory scan pass over nested zip index layers...")
+            # Unbox and trace filenames purely inside RAM
+            extracted_map = scan_archive_pure_memory(self.save_path)
+            self.signals.success_signal.emit(extracted_map)
+        except Exception as err:
+            self.signals.failure_signal.emit(str(err))
 
 
 class MplCanvas(FigureCanvas):
@@ -55,6 +89,9 @@ class NISTDesktopWorkbench(QMainWindow):
         self.active_model_id = None
         self.active_wind_angle = None
         self.extracted_hdf_map = {}
+        
+        # 🎯 Initialize the background thread execution pool
+        self.threadpool = QThreadPool.globalInstance()
         
         initialize_local_database()
         self.init_ui_layout()
@@ -222,6 +259,7 @@ class NISTDesktopWorkbench(QMainWindow):
             self.btn_scan_zip.setEnabled(True)
 
     def handle_zip_download_and_scan(self):
+        """🎯 THREADED STAGE 1 UI HOOK: Dispatches the download and memory mapping tasks safely to the background pool."""
         self.zip_angle_combo.clear()
         self.btn_ingest.setEnabled(False)
         self.extracted_hdf_map = {}
@@ -233,36 +271,42 @@ class NISTDesktopWorkbench(QMainWindow):
         master_zip_path = os.path.join(DROP_FOLDER, file_name)
         os.makedirs(DROP_FOLDER, exist_ok=True)
         
-        self.log_message(f"\n📥 Streaming master package mirror archive ({file_name})...")
+        # Deactivate scanner button to block double clicks during execution
+        self.btn_scan_zip.setEnabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         
-        try:
-            with self.session.get(download_url, stream=True, timeout=45, verify=False) as r:
-                r.raise_for_status()
-                with open(master_zip_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        f.write(chunk)
-            
-            self.log_message("⚡ Forwarding to parser core to map parameters...")
-            QApplication.processEvents()
-            
-            self.extracted_hdf_map = scan_archive_pure_memory(master_zip_path)
-                
-            if self.extracted_hdf_map:
-                for encoded_angle in sorted(self.extracted_hdf_map.keys()):
-                    display_angle = float(encoded_angle / 10.0)
-                    self.zip_angle_combo.addItem(f"Wind Orientation Angle: {display_angle}°", encoded_angle)
-                self.log_message(f"🎉 Scan Complete! Populated drop-down array with {len(self.extracted_hdf_map)} wind orientations.")
-                self.btn_ingest.setEnabled(True)
-            else:
-                self.log_message("❌ Ingestion Error: Parser backend failed to isolate matching entries inside zip layers.")
-                
-        except Exception as e:
-            self.log_message(f"❌ Processing Pipeline Ingestion Fault: {e}")
-        finally:
-            QApplication.restoreOverrideCursor()
+        # Instantiate and configure our runnable asset payload
+        runnable = ArchiveScannerRunnable(self.session, download_url, master_zip_path)
+        runnable.signals.progress_signal.connect(self.log_message)
+        runnable.signals.success_signal.connect(self.handle_background_scan_success)
+        runnable.signals.failure_signal.connect(self.handle_background_scan_failure)
+        
+        # Push to background queue thread allocations instantly
+        self.threadpool.start(runnable)
+
+    def handle_background_scan_success(self, extracted_map):
+        """Processes the extracted map from the background thread safely without UI lockup."""
+        self.extracted_hdf_map = extracted_map
+        QApplication.restoreOverrideCursor()
+        self.btn_scan_zip.setEnabled(True)
+        
+        if self.extracted_hdf_map:
+            for encoded_angle in sorted(self.extracted_hdf_map.keys()):
+                display_angle = float(encoded_angle / 10.0)
+                self.zip_angle_combo.addItem(f"Wind Orientation Angle: {display_angle}°", encoded_angle)
+            self.log_message(f"🎉 Scan Complete! Populated drop-down menu with {len(self.extracted_hdf_map)} wind orientations.")
+            self.btn_ingest.setEnabled(True)
+        else:
+            self.log_message("❌ Ingestion Error: Parser backend failed to isolate matching entries inside zip layers.")
+
+    def handle_background_scan_failure(self, error_message):
+        """Catches and handles any exceptions raised inside the background thread."""
+        QApplication.restoreOverrideCursor()
+        self.log_message(f"❌ Thread Ingestion Error: {error_message}")
+        self.btn_scan_zip.setEnabled(True)
 
     def handle_selected_hdf_ingestion(self):
+        """🎯 STAGE 2: Extracts the single selected HDF target and saves it to the unified database."""
         self.btn_export_all_time.setEnabled(False)
         self.btn_export_summary.setEnabled(False)
         self.btn_plot_contour.setEnabled(False)
@@ -271,14 +315,13 @@ class NISTDesktopWorkbench(QMainWindow):
         target_info = self.extracted_hdf_map.get(chosen_encoded_angle)
         
         if not target_info:
-            self.log_message("❌ Ingestion Fault: Selected target data block is missing from temporary workspace cache.")
+            self.log_message("❌ Ingestion Fault: Selected target data block is missing from temporary memory cache.")
             return
             
         self.log_message(f"⚡ Unboxing datasets for wind angle: {float(chosen_encoded_angle / 10.0)}°...")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         
         try:
-            # 🎯 FIX: Unpack the required parent zip path and filename coordinate track tuple targets natively
             model_id, wind_angle = populate_database_from_archive(target_info[0], target_info[1], target_angle=chosen_encoded_angle)
             if model_id is not None:
                 self.active_model_id, self.active_wind_angle = model_id, wind_angle
