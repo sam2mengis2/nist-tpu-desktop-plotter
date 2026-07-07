@@ -1,187 +1,258 @@
-import pandas as pd
-import io
-from scipy.interpolate import griddata
-import numpy as np
+# -*- coding: utf-8 -*-
+"""
+NIST_pipeline/NIST_parser.py - High-Performance File Extraction & Storage Backend
+Implements In-Memory RAM Archive Sifting and Targeted HDF4 Processing.
+"""
+
+import os
 import re
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-from pyhdf.SD import SD, SDC
-from scipy.io import loadmat
-from mpl_toolkits.mplot3d import Axes3D
-from pyhdf.SD import SD, SDC
-import matplotlib.pyplot as plt
-from itertools import islice
-from interface import NIST_Interface
+import sqlite3
+import zipfile
+import io
+import numpy as np
+from pyhdf.SD import SD, SDC  # Requires: pip install pyhdf
+
+DB_PATH = r"C:\FINAL_SUMMER_PROJ\final_local_db_pipeline\local_wind_data.db"
+DROP_FOLDER = r"C:\FINAL_SUMMER_PROJ\final_local_db_pipeline\file_drop"
 
 
-class NIST_DATA_ANALYZER(NIST_Interface):
-    def __init__(self):
-        pass
-
-
-    def get_mean_contour(self, face_no, flat_tap_coords, pressure_series):
-        """Generates a mean pressure coefficient contour map. 
-        Compatible with both legacy local files and pre-computed cloud database DataFrames.
-        """
-        # =========================================================================
-        # 1. DATA EXTRACTION LAYER (Handles Cloud DB vs Legacy File structures)
-        # =========================================================================
-        
-        # Check if the inputs match the new Cloud DB master dataframe properties
-        is_cloud_data = False
-        if isinstance(flat_tap_coords, pd.DataFrame):
-            if 'x_coordinate' in flat_tap_coords.columns or 'x_coordinate' in flat_tap_coords.index:
-                is_cloud_data = True
-
-        if is_cloud_data:
-            # If the dataframe was passed in transposed via the UI cache dictionary
-            if 'x_coordinate' in flat_tap_coords.index:
-                df_spatial = flat_tap_coords.T
-                df_pressure = pressure_series.T
-                
-                # Extract values directly (Cloud data has pre-computed metrics)
-                x = pd.to_numeric(df_spatial['x_coordinate']).values
-                y = pd.to_numeric(df_spatial['y_coordinate']).values
-                z = pd.to_numeric(df_pressure['mean_cp']).values
-            else:
-                # If the raw master_df was passed directly into the method
-                clean_df = flat_tap_coords.drop_duplicates(subset=['x_coordinate', 'y_coordinate'])
-                x = pd.to_numeric(clean_df['x_coordinate']).values
-                y = pd.to_numeric(clean_df['y_coordinate']).values
-                z = pd.to_numeric(clean_df['mean_cp']).values
-                
-        else:
-            # Legacy local file path logic (.hdf / .mat)
-            mean_cp_series = pressure_series.mean(axis=0)
-            pressure_df = mean_cp_series.reset_index()
-            pressure_df.columns = ['Tap no.', 'mean_cp']
-            
-            all_means = pressure_df['mean_cp'].values
-            num_taps = len(flat_tap_coords)
-            matched_means = all_means[:num_taps]
-            
-            flat_tap_coords = flat_tap_coords.copy()
-            flat_tap_coords['mean_cp'] = matched_means        
-            
-            # Slicing the structural face layout
-            unique_faces = flat_tap_coords[1].dropna().unique()
-            face_dfs = {face_num: flat_tap_coords[flat_tap_coords[1] == face_num].copy() for face_num in unique_faces}
-            
-            face_df = face_dfs.get(face_no, list(face_dfs.values())[0])
-            clean_df = face_df.drop_duplicates(subset=[2, 3])
-            
-            x = clean_df[2].values
-            y = clean_df[3].values
-            z = clean_df['mean_cp'].values
-
-        # =========================================================================
-        # 2. MATHEMATICAL SURFACE INTERPOLATION & PLOTTING LAYER
-        # =========================================================================
-        # Remove any potential NaN values to ensure griddata processing doesn't fail
-        valid_mask = ~np.isnan(x) & ~np.isnan(y) & ~np.isnan(z)
-        x, y, z = x[valid_mask], y[valid_mask], z[valid_mask]
-
-        # Define the high-resolution grid layout space
-        grid_x, grid_y = np.meshgrid(
-            np.linspace(x.min(), x.max(), 100),
-            np.linspace(y.min(), y.max(), 100)
+def initialize_local_database():
+    """Initializes unified database schemas at the project root level."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS origin_models (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            model_name TEXT UNIQUE,
+            total_taps INTEGER
         )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tap_measurements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            model_id INTEGER,
+            wind_angle INTEGER,
+            tap_number INTEGER,
+            mean_cp REAL,
+            std_cp REAL,
+            face INTEGER,
+            x_coord REAL,
+            y_coord REAL,
+            time_history BLOB,
+            FOREIGN KEY(model_id) REFERENCES origin_models(id),
+            UNIQUE(model_id, wind_angle, tap_number)
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-        # Interpolate scatter array values onto the continuous coordinates grid mesh
-        grid_z = griddata((x, y), z, (grid_x, grid_y), method='cubic')
 
-        # Generate the colored contour canvas
-        plt.figure(figsize=(8, 6))
-        contour = plt.contourf(grid_x, grid_y, grid_z, levels=20, cmap='RdBu_r')
-        plt.colorbar(contour, label="Mean $C_p$")
+def scan_archive_pure_memory(master_zip_path):
+    """
+    🎯 IN-MEMORY SCANNER: Maps out wind orientation angles purely inside RAM bytes buffers
+    without extracting anything to your hard drive. Extremely fast and prevents UI freeze.
+    """
+    extracted_hdf_map = {}
 
-        # Overlay geometric tap coordinates to check coverage verification
-        plt.scatter(x, y, c='black', s=15, marker='x', label='Taps')
+    def walk_zip_stream(zip_file_context, source_path_or_buffer):
+        for entry in zip_file_context.infolist():
+            if entry.filename.lower().endswith('.zip'):
+                try:
+                    # Unbox the nested zip file directly into a RAM byte stream buffer
+                    nested_zip_bytes = zip_file_context.read(entry.filename)
+                    nested_stream = io.BytesIO(nested_zip_bytes)
+                    with zipfile.ZipFile(nested_stream, 'r') as sub_z:
+                        walk_zip_stream(sub_z, source_path_or_buffer)
+                except Exception as e:
+                    print(f"⚠️ Failed to parse inner nested zip memory stream: {e}")
+            elif entry.filename.lower().endswith('.hdf'):
+                filename_base = os.path.basename(entry.filename)
+                clean_name = filename_base.replace(".hdf", "").replace(".HDF", "")
+                
+                # README Position Slicing Rule (16-19)
+                if len(clean_name) >= 19 and clean_name[15:19].isdigit():
+                    angle_key = int(clean_name[15:19])
+                    # Preserve the internal file track name so we can pull it later
+                    extracted_hdf_map[angle_key] = (source_path_or_buffer, entry.filename)
 
-        plt.title(f"Mean Pressure Coefficient ($C_p$) Distribution")
-        plt.xlabel("X Coordinate")
-        plt.ylabel("Y Coordinate")
-        plt.legend()
+    if os.path.exists(master_zip_path):
+        try:
+            with zipfile.ZipFile(master_zip_path, 'r') as z:
+                walk_zip_stream(z, master_zip_path)
+        except Exception as e:
+            print(f"❌ Failed to parse master archive stream: {e}")
+            
+    return extracted_hdf_map
 
-        # Apply spatial bounding display safety padding
-        current_x_min, current_x_max = plt.xlim()
-        current_y_min, current_y_max = plt.ylim()
-        buffer = 2.5 
-        plt.xlim(current_x_min - buffer, current_x_max + buffer)
-        plt.ylim(current_y_min - buffer, current_y_max + buffer)
+
+def populate_database_from_archive(zip_path, internal_hdf_name, target_angle):
+    """
+    🎯 TARGETED PARSER: Pulls only the selected single HDF file from the archive path,
+    sifts dimensions using metadata hooks, and commits records to SQLite.
+    """
+    target_hdf_dest = os.path.join(DROP_FOLDER, os.path.basename(internal_hdf_name))
+    os.makedirs(DROP_FOLDER, exist_ok=True)
+    
+    # Extract only the selected HDF target file to the local drop folder
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as z:
+            # Check for multi-tiered nested components
+            try:
+                with open(target_hdf_dest, 'wb') as f:
+                    f.write(z.read(internal_hdf_name))
+            except KeyError:
+                # If nested deeply, unpack using temporary structural discovery steps
+                def locate_and_extract(parent_zip):
+                    for entry in parent_zip.infolist():
+                        if entry.filename.lower().endswith('.zip'):
+                            nested_stream = io.BytesIO(parent_zip.read(entry.filename))
+                            with zipfile.ZipFile(nested_stream, 'r') as sub_z:
+                                if locate_and_extract(sub_z): return True
+                        elif entry.filename == internal_hdf_name:
+                            with open(target_hdf_dest, 'wb') as f:
+                                f.write(parent_zip.read(entry.filename))
+                            return True
+                    return False
+                locate_and_extract(z)
+    except Exception as e:
+        print(f"❌ Direct Target Extraction Failure: {e}")
+        return None, None
+
+    if not os.path.exists(target_hdf_dest):
+        print("❌ Error: Target HDF file extraction vanished from output space.")
+        return None, None
+
+    base_name = os.path.basename(target_hdf_dest)
+    name_part = base_name.split('.')[0]
+    model_name = name_part[:15] if len(name_part) >= 15 else name_part
+    wind_angle = int(int(target_angle) / 10)
+
+    try:
+        hdf_obj = SD(target_hdf_dest, SDC.READ)
+        datasets_dict = hdf_obj.datasets()
+    except Exception as e:
+        print(f"❌ HDF4 Open Error: {e}")
+        if os.path.exists(target_hdf_dest): os.remove(target_hdf_dest)
+        return None, None
+
+    # Identify array blocks safely using metadata shapes
+    main_ds_name = None
+    max_size = 0
+    ds_info_map = {}
+    
+    for ds_name in datasets_dict.keys():
+        try:
+            ds_select = hdf_obj.select(ds_name)
+            _, rank, dims, _, _ = ds_select.info()
+            ds_select.endaccess()
+            
+            ds_info_map[ds_name] = dims
+            size = 1
+            for d in dims: size *= d
+            if size > max_size and rank == 2:
+                max_size = size
+                main_ds_name = ds_name
+        except Exception:
+            pass
+
+    if not main_ds_name:
+        hdf_obj.end()
+        if os.path.exists(target_hdf_dest): os.remove(target_hdf_dest)
+        return None, None
+
+    data_matrix = hdf_obj.select(main_ds_name).get()
+    total_taps, time_steps = data_matrix.shape
+
+    stats_matrix = None
+    location_matrix = None
+
+    for ds_name, dims in ds_info_map.items():
+        if ds_name.lower() == "tap_max_min_mean_rms":
+            stats_matrix = hdf_obj.select(ds_name).get()
+        elif ds_name != main_ds_name and ds_name.lower() != "tap_max_min_mean_rms":
+            if len(dims) == 2:
+                if (dims[0] == total_taps and dims[1] == 4) or (dims[1] == total_taps and dims[0] == 4):
+                    location_matrix = hdf_obj.select(ds_name).get() if dims[0] == total_taps else hdf_obj.select(ds_name).get().T
+
+    hdf_obj.end()
+    if os.path.exists(target_hdf_dest):
+        try: os.remove(target_hdf_dest)
+        except Exception: pass
+
+    mean_vector, rms_vector = None, None
+    if stats_matrix is not None:
+        if stats_matrix.shape[0] == 4:
+            mean_vector = stats_matrix[2, :]
+            rms_vector = stats_matrix[3, :]
+        elif stats_matrix.shape[1] == 4:
+            mean_vector = stats_matrix[:, 2]
+            rms_vector = stats_matrix[:, 3]
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("PRAGMA synchronous = OFF")
+        cursor.execute("PRAGMA journal_mode = MEMORY")
         
-        plt.show()
+        cursor.execute("INSERT OR IGNORE INTO origin_models (model_name, total_taps) VALUES (?, ?)", (model_name, total_taps))
+        cursor.execute("SELECT id FROM origin_models WHERE model_name = ?", (model_name,))
+        model_id = cursor.fetchone()[0]
+        
+        for tap_idx in range(total_taps):
+            raw_series = data_matrix[tap_idx, :]
 
-    def get_std_contour(self, face_no, flat_tap_coords, pressure_series):
-            # 1. Calculate the standard deviation (std) across each column channel
-            std_cp_series = pressure_series.std(axis=0)
+            if mean_vector is not None and rms_vector is not None:
+                mean_val = float(mean_vector[tap_idx])
+                std_val = float(rms_vector[tap_idx])
+            else:
+                mean_val = float(np.mean(raw_series))
+                std_val = float(np.std(raw_series))
 
-            pressure_df = std_cp_series.reset_index()
-            pressure_df.columns = ['Tap no.', 'std_cp']
-            
-            all_stds = pressure_df['std_cp'].values
-            num_taps = len(flat_tap_coords)
-            matched_stds = all_stds[:num_taps]
+            tap_number, face_code, x_coord, y_coord = tap_idx + 1, 1, None, None
+            if location_matrix is not None:
+                try:
+                    tap_number = int(round(location_matrix[tap_idx, 0]))
+                    face_code = int(round(location_matrix[tap_idx, 1]))
+                    x_coord = float(location_matrix[tap_idx, 2])
+                    y_coord = float(location_matrix[tap_idx, 3])
+                except Exception:
+                    pass
 
-            # 2. Safely copy the coordinates and paste the std values into it
-            # Making a copy prevents overwriting the columns used by your mean plots
-            coords_copy = flat_tap_coords.copy()
-            coords_copy['std_cp'] = matched_stds        
-            
-            face_dfs = {}
+            binary_blob = sqlite3.Binary(raw_series.astype(np.float32).tobytes())
+            cursor.execute("""
+                INSERT OR REPLACE INTO tap_measurements 
+                (model_id, wind_angle, tap_number, mean_cp, std_cp, face, x_coord, y_coord, time_history) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (model_id, wind_angle, tap_number, mean_val, std_val, face_code, x_coord, y_coord, binary_blob))
 
-            # 3. Find all the unique face numbers in your dataset
-            unique_faces = coords_copy[1].dropna().unique()
+        conn.commit()
+        return model_id, wind_angle
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ Database error: {e}")
+        return None, None
+    finally:
+        conn.close()
 
-            # 4. Loop through and slice the master table
-            for face_num in unique_faces:
-                face_data = coords_copy[coords_copy[1] == face_num].copy()
-                face_dfs[face_num] = face_data
 
-            face_df = face_dfs[face_no]
+def clear_session_data():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM tap_measurements")
+        cursor.execute("DELETE FROM origin_models")
+        conn.commit()
+        cursor.execute("VACUUM")
+        conn.commit()
+    except Exception: pass
+    finally: conn.close()
 
-            # Create a temporary DataFrame to safely drop duplicate spatial locations
-            clean_df = face_df.drop_duplicates(subset=[2, 3])
-            x = clean_df[2].values
-            y = clean_df[3].values
-            z = clean_df['std_cp'].values
-
-            # 5. Define the grid resolution
-            grid_x, grid_y = np.meshgrid(
-                np.linspace(x.min(), x.max(), 100),
-                np.linspace(y.min(), y.max(), 100)
-            )
-
-            # 6. Interpolate the std_cp values onto the grid
-            grid_z = griddata((x, y), z, (grid_x, grid_y), method='cubic')
-
-            # 7. Generate the contour plot
-            plt.figure(figsize=(8, 6))
-            
-            # Using YlOrRd since standard deviations are always positive numbers
-            contour = plt.contourf(grid_x, grid_y, grid_z, levels=20, cmap='YlOrRd')
-            
-            # Add the formatted colorbar scale
-            import matplotlib.ticker as ticker
-            cbar = plt.colorbar(contour, label="Std Dev $C_p$")
-            cbar.ax.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.1f'))
-
-            # Overlay the tap locations to verify grid coverage
-            plt.scatter(x, y, c='black', s=15, marker='x', label='Taps')
-
-            plt.title(f"Face {int(face_no)} Standard Deviation Pressure Distribution", fontweight='bold')
-            plt.xlabel("X")
-            plt.ylabel("Y")
-            plt.legend()
-
-            # Grab your current minimums and maximums
-            current_x_min, current_x_max = plt.xlim()
-            current_y_min, current_y_max = plt.ylim()
-
-            # Keeps your identical 2.5 unit layout zoom-out buffer shift
-            buffer = 2.5 
-            plt.xlim(current_x_min - buffer, current_x_max + buffer)
-            plt.ylim(current_y_min - buffer, current_y_max + buffer)
-            
-            plt.show()
-
- 
+    if os.path.exists(ARCHIVE_TEMP_DIR):
+        try: shutil.rmtree(ARCHIVE_TEMP_DIR)
+        except Exception: pass
+    if os.path.exists(DROP_FOLDER):
+        for filename in os.listdir(DROP_FOLDER):
+            file_path = os.path.join(DROP_FOLDER, filename)
+            try:
+                if os.path.isfile(file_path): os.remove(file_path)
+            except Exception: pass
