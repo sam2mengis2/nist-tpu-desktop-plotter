@@ -17,7 +17,7 @@ DB_PATH = r"C:\FINAL_SUMMER_PROJ\final_local_db_pipeline\NIST_pipeline\local_win
 DROP_FOLDER = r"C:\FINAL_SUMMER_PROJ\final_local_db_pipeline\file_drop"
 ARCHIVE_TEMP_DIR = os.path.join(DROP_FOLDER, "unpacked_temp")
 
-
+ 
 def initialize_local_database():
     """Initializes unified database schemas at the project root level."""
     conn = sqlite3.connect(DB_PATH)

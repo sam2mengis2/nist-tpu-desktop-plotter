@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 NIST_pipeline/app_gui.py - Dedicated NIST Aerodynamic User Interface Frame
-Cleanly refactored with a global QThreadPool to prevent application freezing loops.
+Cleanly refactored with background thread pools and full tap time-history plotting.
 """
 
 import sys
@@ -43,7 +43,7 @@ class WorkerSignals(QObject):
 
 
 class ArchiveScannerRunnable(QRunnable):
-    """🎯 BACKGROUND WORKER: Executes file streaming and memory scanning tasks on a separate thread pool."""
+    """BACKGROUND WORKER: Executes file streaming and memory scanning tasks on a separate thread pool."""
     def __init__(self, session, download_url, save_path):
         super().__init__()
         self.session = session
@@ -61,7 +61,6 @@ class ArchiveScannerRunnable(QRunnable):
                         f.write(chunk)
             
             self.signals.progress_signal.emit("⚡ Running in-memory scan pass over nested zip index layers...")
-            # Unbox and trace filenames purely inside RAM
             extracted_map = scan_archive_pure_memory(self.save_path)
             self.signals.success_signal.emit(extracted_map)
         except Exception as err:
@@ -90,7 +89,6 @@ class NISTDesktopWorkbench(QMainWindow):
         self.active_wind_angle = None
         self.extracted_hdf_map = {}
         
-        # 🎯 Initialize the background thread execution pool
         self.threadpool = QThreadPool.globalInstance()
         
         initialize_local_database()
@@ -178,6 +176,21 @@ class NISTDesktopWorkbench(QMainWindow):
         self.btn_plot_contour.clicked.connect(self.render_spatial_contour_map)
         self.btn_plot_contour.setEnabled(False)
         dashboard_layout.addWidget(self.btn_plot_contour)
+        
+        dashboard_layout.addWidget(QFrame(frameShape=QFrame.Shape.HLine))
+        
+        # 🎯 NEW FEATURE: Interactive Tap Selection Dropdown
+        dashboard_layout.addWidget(QLabel("Select Target Tap for Time History Plot:"))
+        self.tap_combo = QComboBox()
+        dashboard_layout.addWidget(self.tap_combo)
+        
+        # 🎯 NEW FEATURE: Time History Generation Button
+        self.btn_plot_history = QPushButton("Render Tap Cp Time History Plot")
+        self.btn_plot_history.setStyleSheet("font-weight: bold; background-color: #8e44ad; color: white;")
+        self.btn_plot_history.clicked.connect(self.render_tap_time_history_plot)
+        self.btn_plot_history.setEnabled(False)
+        dashboard_layout.addWidget(self.btn_plot_history)
+        
         left_layout.addWidget(dashboard_group)
 
         log_group = QGroupBox("Activity Diagnostics Console")
@@ -259,7 +272,6 @@ class NISTDesktopWorkbench(QMainWindow):
             self.btn_scan_zip.setEnabled(True)
 
     def handle_zip_download_and_scan(self):
-        """🎯 THREADED STAGE 1 UI HOOK: Dispatches the download and memory mapping tasks safely to the background pool."""
         self.zip_angle_combo.clear()
         self.btn_ingest.setEnabled(False)
         self.extracted_hdf_map = {}
@@ -271,21 +283,17 @@ class NISTDesktopWorkbench(QMainWindow):
         master_zip_path = os.path.join(DROP_FOLDER, file_name)
         os.makedirs(DROP_FOLDER, exist_ok=True)
         
-        # Deactivate scanner button to block double clicks during execution
         self.btn_scan_zip.setEnabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         
-        # Instantiate and configure our runnable asset payload
         runnable = ArchiveScannerRunnable(self.session, download_url, master_zip_path)
         runnable.signals.progress_signal.connect(self.log_message)
         runnable.signals.success_signal.connect(self.handle_background_scan_success)
         runnable.signals.failure_signal.connect(self.handle_background_scan_failure)
         
-        # Push to background queue thread allocations instantly
         self.threadpool.start(runnable)
 
     def handle_background_scan_success(self, extracted_map):
-        """Processes the extracted map from the background thread safely without UI lockup."""
         self.extracted_hdf_map = extracted_map
         QApplication.restoreOverrideCursor()
         self.btn_scan_zip.setEnabled(True)
@@ -294,13 +302,12 @@ class NISTDesktopWorkbench(QMainWindow):
             for encoded_angle in sorted(self.extracted_hdf_map.keys()):
                 display_angle = float(encoded_angle / 10.0)
                 self.zip_angle_combo.addItem(f"Wind Orientation Angle: {display_angle}°", encoded_angle)
-            self.log_message(f"🎉 Scan Complete! Populated drop-down menu with {len(self.extracted_hdf_map)} wind orientations.")
+            self.log_message(f"🎉 Scan Complete! Populated Drop-Down menu with {len(self.extracted_hdf_map)} wind orientations.")
             self.btn_ingest.setEnabled(True)
         else:
             self.log_message("❌ Ingestion Error: Parser backend failed to isolate matching entries inside zip layers.")
 
     def handle_background_scan_failure(self, error_message):
-        """Catches and handles any exceptions raised inside the background thread."""
         QApplication.restoreOverrideCursor()
         self.log_message(f"❌ Thread Ingestion Error: {error_message}")
         self.btn_scan_zip.setEnabled(True)
@@ -310,40 +317,110 @@ class NISTDesktopWorkbench(QMainWindow):
         self.btn_export_all_time.setEnabled(False)
         self.btn_export_summary.setEnabled(False)
         self.btn_plot_contour.setEnabled(False)
+        self.btn_plot_history.setEnabled(False)
         
         chosen_encoded_angle = self.zip_angle_combo.currentData()
         target_info = self.extracted_hdf_map.get(chosen_encoded_angle)
         
         if not target_info:
-            self.log_message("❌ Ingestion Fault: Selected target data block is missing from temporary memory cache.")
+            self.log_message("❌ Ingestion Fault: Selected target data block is missing from temporary workspace cache.")
             return
             
         self.log_message(f"⚡ Unboxing datasets for wind angle: {float(chosen_encoded_angle / 10.0)}°...")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         
         try:
-            model_id, wind_angle = populate_database_from_archive(target_info[0], target_info[1], target_angle=chosen_encoded_angle)
+            # 🎯 FIXED: Direct, clean call to the background unboxer function
+            model_id, wind_angle = populate_database_from_archive(
+                target_info[0],       # master zip file path
+                target_info[1],       # internal target .HDF path name
+                chosen_encoded_angle  # raw wind angle code key
+            )
+
             if model_id is not None:
                 self.active_model_id, self.active_wind_angle = model_id, wind_angle
-                self.log_message(f"🎉 Load Complete! Active wind angle selection locked at: {float(wind_angle / 10.0 if wind_angle > 360 else wind_angle)}°")
+                self.log_message("🎉 Ingestion complete! Cache is synchronized.")
                 
+                # Dynamic Face Dropdown Update
                 self.face_combo.clear()
                 self.face_combo.addItem("All Faces Combined", "all")
+                
                 conn = sqlite3.connect(DB_PATH)
                 cursor = conn.cursor()
                 cursor.execute("SELECT DISTINCT face FROM tap_measurements WHERE model_id=? AND wind_angle=? AND face IS NOT NULL ORDER BY face", (self.active_model_id, self.active_wind_angle))
-                for face_num in [row[0] for row in cursor.fetchall()]: self.face_combo.addItem(f"Face {face_num} Layout", face_num)
+                for face_num in [row[0] for row in cursor.fetchall()]: 
+                    self.face_combo.addItem(f"Face {face_num} Layout", face_num)
+                
+                # Query and populate distinct sensor tap identifiers
+                cursor.execute("SELECT DISTINCT tap_number FROM tap_measurements WHERE model_id=? AND wind_angle=? ORDER BY tap_number", (self.active_model_id, self.active_wind_angle))
+                discovered_taps = [row[0] for row in cursor.fetchall()]
                 conn.close()
+                
+                self.tap_combo.clear()
+                for tap_num in discovered_taps:
+                    self.tap_combo.addItem(f"Physical Tap {tap_num}", tap_num)
+                
+                self.log_message(f"📋 Loaded {len(discovered_taps)} active spatial tap channels into plot selectors.")
                 
                 self.btn_export_all_time.setEnabled(True)
                 self.btn_export_summary.setEnabled(True)
                 self.btn_plot_contour.setEnabled(True)
+                self.btn_plot_history.setEnabled(True)
             else:
                 self.log_message("❌ Processing Pipeline Ingestion Fault: Parser returned NULL data blocks.")
         except Exception as e:
             self.log_message(f"❌ Pipeline Fault: {e}")
         finally:
             QApplication.restoreOverrideCursor()
+
+    def render_tap_time_history_plot(self):
+        """🎯 NEW PLOTTER ENGINE: Extracts raw horizontal float streams out of SQLite and renders full history graphs."""
+        if not self.active_model_id: 
+            return
+            
+        selected_tap = self.tap_combo.currentData()
+        if selected_tap is None: 
+            return
+        
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT time_history 
+                FROM tap_measurements 
+                WHERE model_id=? AND wind_angle=? AND tap_number=?
+            """, (self.active_model_id, self.active_wind_angle, selected_tap))
+            row = cursor.fetchone()
+            conn.close()
+            
+            if not row or not row[0]:
+                self.log_message(f"❌ Plotter fault: No time history payload cached for Tap {selected_tap}.")
+                return
+                
+            # Unbox the flat continuous byte chunk straight back into low-overhead float metrics
+            series = np.frombuffer(row[0], dtype=np.float32)
+            time_steps = np.arange(len(series))
+            
+            # Refresh Matplotlib frame
+            self.canvas.figure.clear()
+            self.canvas.axes = self.canvas.figure.add_subplot(111)
+            
+            # High-performance crisp fine-line rendering parameter assignment
+            self.canvas.axes.plot(time_steps, series, color='#8e44ad', linewidth=0.7, alpha=0.85)
+            
+            # Graphical annotations and typography
+            angle_deg = float(self.active_wind_angle / 10.0 if self.active_wind_angle > 360 else self.active_wind_angle)
+            self.canvas.axes.set_title(f"Tap {selected_tap} Fluctuation Signal History (Wind Angle: {angle_deg}°)")
+            self.canvas.axes.set_xlabel("Time History Frames (Steps)")
+            self.canvas.axes.set_ylabel("Pressure Coefficient Coefficient ($C_p$)")
+            self.canvas.axes.grid(True, linestyle='--', alpha=0.5)
+            
+            self.canvas.figure.tight_layout()
+            self.canvas.draw()
+            self.log_message(f"🎨 UI Visualization frame re-rendered for Tap {selected_tap} Fluctuation Waveform.")
+            
+        except Exception as e:
+            self.log_message(f"❌ Time History Renderer Fault: {e}")
 
     def export_full_time_series_csv(self):
         if not self.active_model_id: return
