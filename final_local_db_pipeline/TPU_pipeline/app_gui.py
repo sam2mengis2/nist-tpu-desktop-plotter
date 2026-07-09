@@ -256,6 +256,21 @@ class TPUDesktopWorkbench(QMainWindow):
         self.btn_plot_contour.setEnabled(False)
         dashboard_layout.addWidget(self.btn_plot_contour)
         
+        dashboard_layout.addWidget(QFrame(frameShape=QFrame.Shape.HLine))
+        
+        # 🎯 NEW FEATURE: Interactive Tap Selection Dropdown
+        dashboard_layout.addWidget(QLabel("Select Target Tap for Time History Plot:"))
+        self.tap_combo = QComboBox()
+        dashboard_layout.addWidget(self.tap_combo)
+        
+        # 🎯 NEW FEATURE: Time History Generation Button
+        self.btn_plot_history = QPushButton("Render Tap Cp Time History Plot")
+        self.btn_plot_history.setStyleSheet("font-weight: bold; background-color: #8e44ad; color: white;")
+        self.btn_plot_history.clicked.connect(self.render_tap_time_history_plot)
+        self.btn_plot_history.setEnabled(False)
+        dashboard_layout.addWidget(self.btn_plot_history)
+
+
         left_layout.addWidget(dashboard_group)
 
         log_group = QGroupBox("System Activity Diagnostics Console")
@@ -464,6 +479,9 @@ class TPUDesktopWorkbench(QMainWindow):
                     ORDER BY face
                 """, (self.active_model_id, self.active_wind_angle))
                 discovered_faces = [row[0] for row in cursor.fetchall()]
+                # Query and populate distinct sensor tap identifiers
+                cursor.execute("SELECT DISTINCT tap_number FROM tap_measurements WHERE model_id=? AND wind_angle=? ORDER BY tap_number", (self.active_model_id, self.active_wind_angle))
+                discovered_taps = [row[0] for row in cursor.fetchall()]
                 conn.close()
                 
                 for face_num in discovered_faces:
@@ -471,9 +489,16 @@ class TPUDesktopWorkbench(QMainWindow):
                 
                 self.log_message(f"📋 Discovered {len(discovered_faces)} unique surface faces inside matrix architecture.")
                 
+                self.tap_combo.clear()
+                for tap_num in discovered_taps:
+                    self.tap_combo.addItem(f"Physical Tap {tap_num}", tap_num)
+                
+                self.log_message(f"📋 Loaded {len(discovered_taps)} active spatial tap channels into plot selectors.")
+
                 self.btn_export_all_time.setEnabled(True)
                 self.btn_export_summary.setEnabled(True)
                 self.btn_plot_contour.setEnabled(True)
+                self.btn_plot_history.setEnabled(True)
             else:
                 self.log_message("❌ Processing Pipeline Ingestion Fault: Parser failed to unbox valid database rows.")
                 
@@ -486,6 +511,55 @@ class TPUDesktopWorkbench(QMainWindow):
                     os.remove(local_path)
                 except Exception:
                     pass
+    def render_tap_time_history_plot(self):
+        """🎯 NEW PLOTTER ENGINE: Extracts raw horizontal float streams out of SQLite and renders full history graphs."""
+        if not self.active_model_id: 
+            return
+            
+        selected_tap = self.tap_combo.currentData()
+        if selected_tap is None: 
+            return
+        
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT time_history 
+                FROM tap_measurements 
+                WHERE model_id=? AND wind_angle=? AND tap_number=?
+            """, (self.active_model_id, self.active_wind_angle, selected_tap))
+            row = cursor.fetchone()
+            conn.close()
+            
+            if not row or not row[0]:
+                self.log_message(f"❌ Plotter fault: No time history payload cached for Tap {selected_tap}.")
+                return
+                
+            # Unbox the flat continuous byte chunk straight back into low-overhead float metrics
+            series = np.frombuffer(row[0], dtype=np.float32)
+            time_steps = np.arange(len(series))
+            
+            # Refresh Matplotlib frame
+            self.canvas.figure.clear()
+            self.canvas.axes = self.canvas.figure.add_subplot(111)
+            
+            # High-performance crisp fine-line rendering parameter assignment
+            self.canvas.axes.plot(time_steps, series, color='#8e44ad', linewidth=0.7, alpha=0.85)
+            
+            # Graphical annotations and typography
+            angle_deg = float(self.active_wind_angle / 10.0 if self.active_wind_angle > 360 else self.active_wind_angle)
+            self.canvas.axes.set_title(f"Tap {selected_tap} Fluctuation Signal History (Wind Angle: {angle_deg}°)")
+            self.canvas.axes.set_xlabel("Time History Frames (Steps)")
+            self.canvas.axes.set_ylabel("Pressure Coefficient Coefficient ($C_p$)")
+            self.canvas.axes.grid(True, linestyle='--', alpha=0.5)
+            
+            self.canvas.figure.tight_layout()
+            self.canvas.draw()
+            self.log_message(f"🎨 UI Visualization frame re-rendered for Tap {selected_tap} Fluctuation Waveform.")
+            
+        except Exception as e:
+            self.log_message(f"❌ Time History Renderer Fault: {e}")
+
 
     def export_full_time_series_csv(self):
         """🎯 UPGRADE: Let user choose the save location natively and prevent automated wiping."""
