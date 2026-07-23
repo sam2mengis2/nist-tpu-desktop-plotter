@@ -498,6 +498,8 @@ class NISTDesktopWorkbench(QMainWindow):
             self.canvas.draw()
         except Exception as e: self.log_message(f"❌ Plotter Error: {e}")
 
+    
+
     def closeEvent(self, event):
         clear_session_data()
         event.accept()

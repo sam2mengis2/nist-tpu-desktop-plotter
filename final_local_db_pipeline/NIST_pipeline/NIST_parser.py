@@ -214,6 +214,22 @@ def populate_database_from_archive(zip_path, internal_hdf_name, target_angle):
         total_active_taps = total_channels
         print(f"⚠️ Warning: 'Flat_Tap_Coordinates' dataset table missing. Defaulting to all {total_channels} channels.")
 
+
+    location_matrix_3d = None
+    for name, arr in all_numeric_datasets.items():
+        if name == 'Tap_Coordinates_3D':
+            location_matrix_3d = arr
+            break
+    if location_matrix_3d is not None:
+        if location_matrix_3d.shape[1] == 5 and location_matrix_3d.shape[0] != 5:
+            location_matrix_3d = location_matrix_3d.T
+
+            total_active_taps_3d = location_matrix_3d.shape[1]
+            print(f"📐 Found 'Tap_Coordinates_3D' mapping table. Total Active Taps constrained to: {total_active_taps_3d}")
+        else:
+            total_active_taps_3d = total_channels
+            print(f"⚠️ Warning: 'Tap_Coordinates_3D' dataset table missing. Defaulting to all {total_channels} channels.")
+
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     try:
@@ -249,12 +265,26 @@ def populate_database_from_archive(zip_path, internal_hdf_name, target_angle):
                 x_coord = None
                 y_coord = None
 
+            if location_matrix_3d is not None:
+                tap_number_3d = int(round(location_matrix_3d[0, tap_idx])) # Row 1 (Index 0): Tap ID
+                face_code_3d  = int(round(location_matrix_3d[1, tap_idx])) # Row 2 (Index 1): Face ID
+                x_coord_3d    = float(location_matrix_3d[2, tap_idx])      # Row 3 (Index 2): X Coordinate
+                y_coord_3d    = float(location_matrix_3d[3, tap_idx])      # Row 4 (Index 3): Y Coordinate
+                z_coord_3d    = float(location_matrix_3d[4, tap_idx])      # Row 5 (Index 4): Z Coordinate
+
+            else:
+                tap_number_3d = 1 + tap_idx
+                face_code_3d = 1
+                x_coord_3d = 1
+                y_coord_3d = 1
+                z_coord_3d = 1
+
             binary_blob = sqlite3.Binary(raw_series.tobytes())
             cursor.execute("""
                 INSERT OR REPLACE INTO tap_measurements 
-                (model_id, wind_angle, tap_number, mean_cp, std_cp, face, x_coord, y_coord, time_history) 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (model_id, wind_angle, tap_number, mean_val, std_val, face_code, x_coord, y_coord, binary_blob))
+                (model_id, wind_angle, tap_number, tap_number_3d, mean_cp, std_cp, face, face_code_3d, x_coord, y_coord, x_coord_3d, y_coord_3d, z_coord_3d, time_history) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (model_id, wind_angle, tap_number, tap_number_3d, mean_val, std_val, face_code, face_code_3d, x_coord, y_coord, x_coord_3d, y_coord_3d, z_coord_3d, binary_blob))
 
         conn.commit()
         return model_id, wind_angle
